@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Tree QA</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark">◇</span>
+          <div class="brand-copy">
+            <strong>Codex Tree QA</strong>
+            <span id="workspaceLabel"></span>
+          </div>
+        </div>
+        <label class="project-select">
+          <span>项目</span>
+          <select id="projectSelect"></select>
+        </label>
+        <label class="search-box">
+          <span>⌕</span>
+          <input id="searchInput" type="search" placeholder="搜索节点" autocomplete="off" />
+        </label>
+        <div class="topbar-actions">
+          <div class="direction-toggle" aria-label="树方向">
+            <button class="active" data-direction="down" type="button">向下</button>
+            <button data-direction="right" type="button">向右</button>
+          </div>
+          <button id="focusBtn" class="icon-button" type="button" title="聚焦">⌖</button>
+          <button id="refreshBtn" class="icon-button" type="button" title="刷新">↻</button>
+        </div>
+      </header>
+
+      <main class="main-layout">
+        <section class="canvas-column">
+          <div id="canvasHost" class="canvas-host">
+            <svg id="treeSvg" role="img" aria-label="Codex 问答树">
+              <defs>
+                <filter id="nodeShadow" x="-20%" y="-20%" width="140%" height="140%">
+                  <feDropShadow dx="0" dy="10" stdDeviation="10" flood-color="#1f2937" flood-opacity="0.14" />
+                </filter>
+              </defs>
+              <g id="viewport">
+                <g id="edgeLayer"></g>
+                <g id="nodeLayer"></g>
+              </g>
+            </svg>
+            <div id="emptyState" class="empty-state">
+              <div class="ghost-root">say something</div>
+            </div>
+            <div class="zoom-controls">
+              <button id="zoomInBtn" class="icon-button" type="button" title="放大">+</button>
+              <button id="zoomOutBtn" class="icon-button" type="button" title="缩小">−</button>
+            </div>
+            <canvas id="miniMap" width="180" height="116"></canvas>
+          </div>
+        </section>
+
+        <div id="sideResizeHandle" class="side-resize-handle" role="separator" aria-orientation="vertical" title="拖拽调整对话栏宽度"></div>
+
+        <aside id="sidePanel" class="side-panel">
+          <section class="chat-header">
+            <div class="panel-heading">
+              <h2 id="detailTitle">对话</h2>
+              <div class="panel-actions">
+                <button id="deleteBtn" class="icon-button danger-button" type="button" title="删除节点及后续节点">⌫</button>
+                <button id="exportBtn" class="icon-button" type="button" title="导出">⇩</button>
+              </div>
+            </div>
+            <div id="detailMeta" class="detail-meta"></div>
+          </section>
+
+          <div id="conversationList" class="conversation-list"></div>
+
+          <section class="attachment-dock">
+            <div class="panel-heading">
+              <h2>附件</h2>
+              <label class="upload-button">
+                <input id="fileInput" type="file" multiple />
+                <span>上传</span>
+              </label>
+            </div>
+            <div id="fileList" class="file-list"></div>
+          </section>
+
+          <form id="composer" class="composer sidebar-composer">
+            <div class="composer-meta">
+              <div id="selectedFiles" class="selected-files"></div>
+            </div>
+            <div class="composer-row">
+              <textarea id="promptInput" rows="3" placeholder="输入问题"></textarea>
+              <button id="sendBtn" type="submit">发送</button>
+            </div>
+          </form>
+        </aside>
+      </main>
+
+    </div>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>
