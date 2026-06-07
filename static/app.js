@@ -292,6 +292,20 @@ function renderMarkdown(text) {
   let list = null;
   let listType = "";
 
+  function isTableSeparator(value) {
+    const cells = splitTableRow(value);
+    if (cells.length < 2) return false;
+    return cells.every((cell) => /^:?-{3,}:?$/.test(cell.trim()));
+  }
+
+  function splitTableRow(value) {
+    let row = String(value || "").trim();
+    if (!row.includes("|")) return [];
+    if (row.startsWith("|")) row = row.slice(1);
+    if (row.endsWith("|")) row = row.slice(0, -1);
+    return row.split("|").map((cell) => cell.trim());
+  }
+
   function flushParagraph() {
     const content = paragraph.join(" ").trim();
     paragraph = [];
@@ -350,6 +364,52 @@ function renderMarkdown(text) {
       resetList();
       root.appendChild(document.createElement("hr"));
       continue;
+    }
+
+    if (trimmed.includes("|") && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
+      const headers = splitTableRow(trimmed);
+      const alignments = splitTableRow(lines[i + 1]).map((cell) => {
+        const value = cell.trim();
+        if (value.startsWith(":") && value.endsWith(":")) return "center";
+        if (value.endsWith(":")) return "right";
+        return "left";
+      });
+      if (headers.length) {
+        flushParagraph();
+        resetList();
+        const wrap = document.createElement("div");
+        wrap.className = "markdown-table-wrap";
+        const table = document.createElement("table");
+        const thead = document.createElement("thead");
+        const headerRow = document.createElement("tr");
+        for (const [index, header] of headers.entries()) {
+          const th = document.createElement("th");
+          th.style.textAlign = alignments[index] || "left";
+          appendInlineMarkdown(th, header);
+          headerRow.appendChild(th);
+        }
+        thead.appendChild(headerRow);
+        table.appendChild(thead);
+        const tbody = document.createElement("tbody");
+        i += 2;
+        while (i < lines.length && lines[i].trim().includes("|") && lines[i].trim()) {
+          const cells = splitTableRow(lines[i]);
+          const tr = document.createElement("tr");
+          for (let index = 0; index < headers.length; index += 1) {
+            const td = document.createElement("td");
+            td.style.textAlign = alignments[index] || "left";
+            appendInlineMarkdown(td, cells[index] || "");
+            tr.appendChild(td);
+          }
+          tbody.appendChild(tr);
+          i += 1;
+        }
+        i -= 1;
+        table.appendChild(tbody);
+        wrap.appendChild(table);
+        root.appendChild(wrap);
+        continue;
+      }
     }
 
     const heading = trimmed.match(/^(#{1,6})\s+(.+)$/);
