@@ -47,6 +47,7 @@ const state = {
   projectNotes: [],
   projectNotesProjectId: null,
   noteContextText: "",
+  scrollConversationToLatest: false,
 };
 
 const els = {
@@ -640,6 +641,7 @@ function matchesSearch(node) {
 
 function shouldDimNode(node) {
   if (state.search && !matchesSearch(node)) return true;
+  if (isNodeActive(node)) return false;
   if (state.selectedId && state.selectedPath.size && !state.selectedPath.has(node.id)) {
     const selected = selectedNode();
     return selected && node.parent_id !== selected.id && selected.parent_id !== node.id;
@@ -1263,6 +1265,10 @@ function renderConversation() {
     bubbles.push(makeBubble("agent", agentText, item.completed_at || item.updated_at || "", toolCallsForNode(item), active));
   }
   els.conversationList.replaceChildren(...bubbles);
+  if (state.scrollConversationToLatest) {
+    els.conversationList.scrollTop = els.conversationList.scrollHeight;
+    state.scrollConversationToLatest = false;
+  }
 }
 
 function renderComposer() {
@@ -1534,6 +1540,7 @@ async function sendPrompt(event) {
     state.fileIds.clear();
     state.workspaceRefs = [];
     els.promptInput.value = "";
+    state.scrollConversationToLatest = true;
     await fetchTree();
     focusSelected();
     await fetchWorkspaceFiles();
