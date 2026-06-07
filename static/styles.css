@@ -1016,22 +1016,16 @@ pre {
 }
 
 .file-row {
-  display: grid;
-  gap: 5px;
+  display: block;
   padding: 10px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: #fff;
 }
 
-.file-row {
-  grid-template-columns: auto minmax(0, 1fr);
-  align-items: center;
-}
-
-.file-row input {
-  width: 16px;
-  height: 16px;
+.file-row:hover {
+  border-color: var(--line-strong);
+  background: #fffdfa;
 }
 
 .file-main {

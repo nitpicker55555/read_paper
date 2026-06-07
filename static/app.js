@@ -713,6 +713,32 @@ function selectedConversationPath() {
   return path.reverse();
 }
 
+function fileById(fileId) {
+  return state.files.find((item) => item.id === fileId) || null;
+}
+
+function contextAttachmentFiles() {
+  const attachments = [];
+  const seen = new Set();
+  for (const node of selectedConversationPath()) {
+    for (const attachment of node.attachments || []) {
+      const fileId = String(attachment.id || "").trim();
+      if (!fileId || seen.has(fileId)) continue;
+      seen.add(fileId);
+      const file = fileById(fileId);
+      const size = Number(attachment.size ?? (file && file.size));
+      attachments.push({
+        id: fileId,
+        original_name: attachment.name || (file && file.original_name) || "未命名附件",
+        mime: attachment.mime || (file && file.mime) || "",
+        size: Number.isFinite(size) ? size : 0,
+        source_title: node.title || "节点",
+      });
+    }
+  }
+  return attachments;
+}
+
 function describeTool(item) {
   const type = item.type || "tool";
   if (type === "command_execution") {
@@ -895,24 +921,17 @@ function renderComposer() {
 }
 
 function renderFiles() {
-  if (!state.files.length) {
+  const files = contextAttachmentFiles();
+  if (!files.length) {
     const empty = document.createElement("div");
     empty.className = "soft-label";
     empty.textContent = "暂无附件";
     els.fileList.replaceChildren(empty);
     return;
   }
-  const rows = state.files.map((file) => {
-    const row = document.createElement("label");
+  const rows = files.map((file) => {
+    const row = document.createElement("div");
     row.className = "file-row";
-    const checkbox = document.createElement("input");
-    checkbox.type = "checkbox";
-    checkbox.checked = state.fileIds.has(file.id);
-    checkbox.addEventListener("change", () => {
-      if (checkbox.checked) state.fileIds.add(file.id);
-      else state.fileIds.delete(file.id);
-      renderComposer();
-    });
     const main = document.createElement("div");
     main.className = "file-main";
     const name = document.createElement("div");
@@ -920,9 +939,9 @@ function renderFiles() {
     name.textContent = file.original_name;
     const sub = document.createElement("div");
     sub.className = "file-sub";
-    sub.textContent = `${formatBytes(file.size)} · ${file.mime || "unknown"}`;
+    sub.textContent = [`来自 ${compact(file.source_title, 28)}`, formatBytes(file.size), file.mime || "unknown"].join(" · ");
     main.append(name, sub);
-    row.append(checkbox, main);
+    row.appendChild(main);
     return row;
   });
   els.fileList.replaceChildren(...rows);
@@ -958,6 +977,7 @@ async function sendPrompt(event) {
       state.selectedProjectId = data.node.id;
       localStorage.setItem("selectedProjectId", state.selectedProjectId);
     }
+    state.fileIds.clear();
     els.promptInput.value = "";
     await fetchTree();
     focusSelected();
