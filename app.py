@@ -128,6 +128,7 @@ def init_db() -> None:
                 tools_count INTEGER NOT NULL DEFAULT 0,
                 attachments_json TEXT NOT NULL DEFAULT '[]',
                 workspace_refs_json TEXT NOT NULL DEFAULT '[]',
+                note_md TEXT NOT NULL DEFAULT '',
                 raw_events_json TEXT NOT NULL DEFAULT '[]',
                 error TEXT,
                 archived INTEGER NOT NULL DEFAULT 0,
@@ -186,6 +187,8 @@ def init_db() -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(nodes)").fetchall()}
         if "workspace_refs_json" not in columns:
             conn.execute("ALTER TABLE nodes ADD COLUMN workspace_refs_json TEXT NOT NULL DEFAULT '[]'")
+        if "note_md" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN note_md TEXT NOT NULL DEFAULT ''")
 
 
 def rows_to_dicts(rows: Iterable[sqlite3.Row]) -> List[Dict[str, Any]]:
@@ -662,6 +665,7 @@ def update_node(node_id: str, **fields: Any) -> None:
         "total_tokens",
         "tools_count",
         "raw_events_json",
+        "note_md",
         "error",
         "archived",
         "bookmarked",
@@ -676,6 +680,44 @@ def update_node(node_id: str, **fields: Any) -> None:
     values = list(payload.values()) + [node_id]
     with DB_LOCK, db_connection() as conn:
         conn.execute(f"UPDATE nodes SET {assignments} WHERE id = ?", values)
+
+
+def nodes_for_project(root_id: str) -> List[Dict[str, Any]]:
+    with DB_LOCK, db_connection() as conn:
+        rows = conn.execute(
+            """
+            WITH RECURSIVE project_nodes(id) AS (
+                SELECT ?
+                UNION ALL
+                SELECT nodes.id FROM nodes JOIN project_nodes ON nodes.parent_id = project_nodes.id
+            )
+            SELECT nodes.* FROM nodes
+            JOIN project_nodes ON nodes.id = project_nodes.id
+            ORDER BY nodes.created_at
+            """,
+            (root_id,),
+        ).fetchall()
+    return [public_node(row) for row in rows]
+
+
+def append_node_note(node_id: str, text: str) -> Dict[str, Any]:
+    addition = text.strip()
+    if not addition:
+        raise ValueError("追加内容不能为空")
+    with DB_LOCK, db_connection() as conn:
+        row = conn.execute("SELECT note_md FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        if not row:
+            raise ValueError("节点不存在")
+        current = str(row["note_md"] or "").rstrip()
+        next_note = f"{current}\n\n{addition}" if current else addition
+        conn.execute(
+            "UPDATE nodes SET note_md = ?, updated_at = ? WHERE id = ?",
+            (next_note, now_iso(), node_id),
+        )
+    node = get_node(node_id)
+    if not node:
+        raise ValueError("节点不存在")
+    return node
 
 
 def add_account_usage(account_name: str, node_id: str, tokens: int) -> None:
@@ -1216,6 +1258,50 @@ def api_workspace_file() -> Any:
         mimetype=mimetypes.guess_type(path.name)[0] or None,
         conditional=True,
     )
+
+
+@app.patch("/api/nodes/<node_id>/note")
+def api_patch_node_note(node_id: str) -> Response:
+    if not get_node(node_id):
+        return jsonify({"error": "节点不存在"}), 404
+    payload = request.get_json(silent=True) or {}
+    note_md = payload.get("note_md", "")
+    if not isinstance(note_md, str):
+        note_md = str(note_md)
+    update_node(node_id, note_md=note_md)
+    return jsonify({"node": get_node(node_id)})
+
+
+@app.post("/api/nodes/<node_id>/note/append")
+def api_append_node_note(node_id: str) -> Response:
+    payload = request.get_json(silent=True) or {}
+    text = payload.get("text", "")
+    if not isinstance(text, str):
+        text = str(text)
+    try:
+        node = append_node_note(node_id, text)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"node": node})
+
+
+@app.get("/api/projects/<project_id>/notes")
+def api_project_notes(project_id: str) -> Response:
+    project = get_node(project_id)
+    if not project:
+        return jsonify({"error": "项目不存在"}), 404
+    notes = [
+        {
+            "id": node["id"],
+            "title": node.get("title") or "节点",
+            "note_md": node.get("note_md") or "",
+            "created_at": node.get("created_at"),
+            "updated_at": node.get("updated_at"),
+        }
+        for node in nodes_for_project(project_id)
+        if str(node.get("note_md") or "").strip()
+    ]
+    return jsonify({"project": {"id": project["id"], "title": project.get("title") or "项目"}, "notes": notes})
 
 
 @app.patch("/api/nodes/<node_id>")

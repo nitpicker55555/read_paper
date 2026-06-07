@@ -85,23 +85,43 @@
               </div>
             </div>
             <div id="detailMeta" class="detail-meta"></div>
+            <div class="side-tabs" aria-label="侧栏">
+              <button class="active" data-side-tab="conversation" type="button">对话</button>
+              <button data-side-tab="notes" type="button">笔记</button>
+            </div>
           </section>
 
-          <div id="conversationList" class="conversation-list"></div>
+          <section id="conversationPane" class="side-tab-panel conversation-pane">
+            <div id="conversationList" class="conversation-list"></div>
 
-          <form id="composer" class="composer sidebar-composer">
-            <div class="composer-meta">
-              <div id="selectedFiles" class="selected-files"></div>
+            <form id="composer" class="composer sidebar-composer">
+              <div class="composer-meta">
+                <div id="selectedFiles" class="selected-files"></div>
+              </div>
+              <div class="composer-row">
+                <label class="composer-upload" title="上传附件" aria-label="上传附件">
+                  <input id="fileInput" type="file" multiple />
+                  <span aria-hidden="true">+</span>
+                </label>
+                <textarea id="promptInput" rows="3" placeholder="输入问题"></textarea>
+                <button id="sendBtn" type="submit">发送</button>
+              </div>
+            </form>
+          </section>
+
+          <section id="notePane" class="side-tab-panel note-pane" hidden>
+            <div class="note-toolbar">
+              <span id="noteStatus" class="note-status">节点笔记</span>
+              <div class="panel-actions">
+                <button id="noteProjectBtn" class="icon-button" type="button" title="读取当前项目所有节点的笔记">☷</button>
+                <button id="noteSaveBtn" class="icon-button" type="button" title="保存笔记">✓</button>
+              </div>
             </div>
-            <div class="composer-row">
-              <label class="composer-upload" title="上传附件" aria-label="上传附件">
-                <input id="fileInput" type="file" multiple />
-                <span aria-hidden="true">+</span>
-              </label>
-              <textarea id="promptInput" rows="3" placeholder="输入问题"></textarea>
-              <button id="sendBtn" type="submit">发送</button>
+            <div id="noteEditorWrap" class="note-editor-wrap">
+              <textarea id="noteEditor" rows="8" placeholder="笔记"></textarea>
             </div>
-          </form>
+            <div id="noteRendered" class="note-rendered"></div>
+          </section>
         </aside>
       </main>
 
@@ -122,6 +142,11 @@
           <div id="workspacePreviewBody" class="workspace-preview-body"></div>
         </section>
       </div>
+
+      <div id="noteContextMenu" class="note-context-menu" hidden>
+        <button id="noteContextAppendBtn" type="button">记录到笔记</button>
+      </div>
+      <div id="nodeNotePreview" class="node-note-preview" hidden></div>
 
     </div>
 

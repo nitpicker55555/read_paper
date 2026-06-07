@@ -37,6 +37,14 @@ const state = {
   resizingSidePanel: false,
   sidePanelWidth: DEFAULT_SIDE_WIDTH,
   sending: false,
+  activeSideTab: "conversation",
+  noteDraftNodeId: null,
+  noteDraft: "",
+  noteDirty: false,
+  noteSaving: false,
+  projectNotes: [],
+  projectNotesProjectId: null,
+  noteContextText: "",
 };
 
 const els = {
@@ -63,7 +71,19 @@ const els = {
   selectedFiles: document.getElementById("selectedFiles"),
   detailTitle: document.getElementById("detailTitle"),
   detailMeta: document.getElementById("detailMeta"),
+  sideTabBtns: document.querySelectorAll("[data-side-tab]"),
+  conversationPane: document.getElementById("conversationPane"),
   conversationList: document.getElementById("conversationList"),
+  notePane: document.getElementById("notePane"),
+  noteStatus: document.getElementById("noteStatus"),
+  noteProjectBtn: document.getElementById("noteProjectBtn"),
+  noteSaveBtn: document.getElementById("noteSaveBtn"),
+  noteEditorWrap: document.getElementById("noteEditorWrap"),
+  noteEditor: document.getElementById("noteEditor"),
+  noteRendered: document.getElementById("noteRendered"),
+  noteContextMenu: document.getElementById("noteContextMenu"),
+  noteContextAppendBtn: document.getElementById("noteContextAppendBtn"),
+  nodeNotePreview: document.getElementById("nodeNotePreview"),
   deleteBtn: document.getElementById("deleteBtn"),
   exportBtn: document.getElementById("exportBtn"),
   fileInput: document.getElementById("fileInput"),
@@ -108,6 +128,13 @@ function compact(text, limit = 140) {
   const normalized = String(text || "").replace(/\s+/g, " ").trim();
   if (normalized.length <= limit) return normalized;
   return `${normalized.slice(0, limit - 1)}…`;
+}
+
+function firstLines(text, limit = 10) {
+  const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
+  const visible = lines.slice(0, limit);
+  if (lines.length > limit) visible.push("...");
+  return visible.join("\n").trim();
 }
 
 function compactFileName(name, head = 10, tail = 12) {
@@ -487,6 +514,8 @@ function render() {
   renderTree();
   renderMiniMap();
   renderConversation();
+  renderSideTabs();
+  renderNotePanel();
   renderComposer();
   renderWorkspaceFiles();
   renderWorkspaceDrawer();
@@ -665,6 +694,40 @@ function edgeClass(parent, node) {
   return ["edge", active ? "active" : "", dimmed ? "dimmed" : ""].filter(Boolean).join(" ");
 }
 
+function positionNodeNotePreview(target) {
+  const rect = target.getBoundingClientRect();
+  const preview = els.nodeNotePreview;
+  const margin = 10;
+  const width = preview.offsetWidth || 260;
+  const height = preview.offsetHeight || 160;
+  const left = clamp(rect.left, margin, window.innerWidth - width - margin);
+  let top = rect.bottom + 8;
+  if (top + height > window.innerHeight - margin) {
+    top = rect.top - height - 8;
+  }
+  preview.style.left = `${left}px`;
+  preview.style.top = `${clamp(top, margin, window.innerHeight - height - margin)}px`;
+}
+
+function showNodeNotePreview(node, target) {
+  const note = firstLines(node.note_md || "", 10);
+  if (!note) return;
+  const pre = document.createElement("pre");
+  pre.textContent = note;
+  els.nodeNotePreview.replaceChildren(pre);
+  els.nodeNotePreview.hidden = false;
+  positionNodeNotePreview(target);
+}
+
+function hideNodeNotePreview() {
+  els.nodeNotePreview.hidden = true;
+}
+
+function openNodeNote(nodeId) {
+  state.activeSideTab = "notes";
+  selectNode(nodeId);
+}
+
 function makeNodeCard(node) {
   const card = document.createElement("div");
   card.setAttribute("xmlns", "http://www.w3.org/1999/xhtml");
@@ -678,15 +741,42 @@ function makeNodeCard(node) {
     .join(" ");
   card.style.setProperty("--node-color", colorFor(node));
   card.dataset.nodeId = node.id;
+  card.title = node.prompt || "";
 
   const top = document.createElement("div");
   top.className = "node-top";
   const title = document.createElement("div");
   title.className = "node-title";
   title.textContent = node.title || "节点";
+  const markers = document.createElement("div");
+  markers.className = "node-markers";
+  if (String(node.note_md || "").trim()) {
+    const noteButton = document.createElement("button");
+    noteButton.type = "button";
+    noteButton.className = "node-note-button";
+    noteButton.setAttribute("aria-label", "笔记");
+    noteButton.setAttribute("title", "");
+    noteButton.textContent = "✎";
+    noteButton.addEventListener("mouseenter", (event) => {
+      card.removeAttribute("title");
+      showNodeNotePreview(node, event.currentTarget);
+    });
+    noteButton.addEventListener("mousemove", (event) => positionNodeNotePreview(event.currentTarget));
+    noteButton.addEventListener("mouseleave", () => {
+      card.title = node.prompt || "";
+      hideNodeNotePreview();
+    });
+    noteButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      hideNodeNotePreview();
+      openNodeNote(node.id);
+    });
+    markers.appendChild(noteButton);
+  }
   const dot = document.createElement("span");
   dot.className = `status-dot status-${node.status || "queued"}`;
-  top.append(title, dot);
+  markers.appendChild(dot);
+  top.append(title, markers);
 
   const snippet = document.createElement("div");
   snippet.className = "node-snippet";
@@ -967,6 +1057,105 @@ function makeBubble(role, text, meta = "", tools = [], active = false, attachmen
   }
   row.appendChild(bubble);
   return row;
+}
+
+function setSideTab(tab) {
+  state.activeSideTab = tab === "notes" ? "notes" : "conversation";
+  hideNoteContextMenu();
+  renderSideTabs();
+  renderNotePanel();
+}
+
+function renderSideTabs() {
+  for (const button of els.sideTabBtns) {
+    const active = button.dataset.sideTab === state.activeSideTab;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+  }
+  els.conversationPane.hidden = state.activeSideTab !== "conversation";
+  els.notePane.hidden = state.activeSideTab !== "notes";
+}
+
+function ensureNoteDraft(node) {
+  if (!node) {
+    state.noteDraftNodeId = null;
+    state.noteDraft = "";
+    state.noteDirty = false;
+    return;
+  }
+  if (state.noteDraftNodeId !== node.id) {
+    state.noteDraftNodeId = node.id;
+    state.noteDraft = node.note_md || "";
+    state.noteDirty = false;
+    state.projectNotes = [];
+    state.projectNotesProjectId = null;
+  }
+}
+
+function renderProjectNotesSummary() {
+  if (!state.projectNotesProjectId) return null;
+  const wrap = document.createElement("section");
+  wrap.className = "project-notes-summary";
+  const title = document.createElement("h3");
+  title.textContent = "项目笔记";
+  wrap.appendChild(title);
+  if (!state.projectNotes.length) {
+    const empty = document.createElement("div");
+    empty.className = "soft-label";
+    empty.textContent = "暂无笔记";
+    wrap.appendChild(empty);
+    return wrap;
+  }
+  for (const item of state.projectNotes) {
+    const article = document.createElement("article");
+    article.className = "project-note-item";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "project-note-title";
+    button.textContent = item.title || "节点";
+    button.addEventListener("click", () => {
+      selectNode(item.id);
+      setSideTab("notes");
+    });
+    article.appendChild(button);
+    article.appendChild(renderMarkdown(item.note_md || ""));
+    wrap.appendChild(article);
+  }
+  return wrap;
+}
+
+function renderNotePanel() {
+  const node = selectedNode();
+  ensureNoteDraft(node);
+  const disabled = !node;
+  els.noteEditor.disabled = disabled || state.noteSaving;
+  els.noteSaveBtn.disabled = disabled || state.noteSaving;
+  els.noteProjectBtn.disabled = !state.selectedProjectId || state.selectedProjectId === "__new__";
+  els.noteStatus.textContent = disabled
+    ? "say something"
+    : state.noteSaving
+      ? "保存中"
+      : state.noteDirty
+        ? "节点笔记未保存"
+        : "节点笔记";
+  if (els.noteEditor.value !== state.noteDraft) {
+    els.noteEditor.value = state.noteDraft;
+  }
+
+  const rendered = document.createElement("div");
+  rendered.className = "note-preview-section";
+  const noteText = state.noteDraft.trim();
+  if (noteText) {
+    rendered.appendChild(renderMarkdown(noteText));
+  } else {
+    const empty = document.createElement("div");
+    empty.className = "conversation-empty";
+    empty.textContent = "say something";
+    rendered.appendChild(empty);
+  }
+  const projectNotes = renderProjectNotesSummary();
+  if (projectNotes) rendered.appendChild(projectNotes);
+  els.noteRendered.replaceChildren(rendered);
 }
 
 function renderConversation() {
@@ -1307,6 +1496,101 @@ async function uploadFiles() {
   await fetchTree();
 }
 
+async function saveNote() {
+  const node = selectedNode();
+  if (!node || state.noteSaving) return;
+  state.noteSaving = true;
+  renderNotePanel();
+  try {
+    const res = await fetch(`/api/nodes/${node.id}/note`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note_md: els.noteEditor.value }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "保存失败");
+    state.noteDirty = false;
+    state.noteDraftNodeId = data.node.id;
+    state.noteDraft = data.node.note_md || "";
+    await fetchTree();
+  } catch (err) {
+    window.alert(err.message);
+  } finally {
+    state.noteSaving = false;
+    renderNotePanel();
+  }
+}
+
+async function readProjectNotes() {
+  const projectId = state.selectedProjectId;
+  if (!projectId || projectId === "__new__") return;
+  const res = await fetch(`/api/projects/${projectId}/notes`);
+  const data = await res.json();
+  if (!res.ok) {
+    window.alert(data.error || "读取失败");
+    return;
+  }
+  state.projectNotes = data.notes || [];
+  state.projectNotesProjectId = projectId;
+  state.activeSideTab = "notes";
+  renderSideTabs();
+  renderNotePanel();
+}
+
+function selectedConversationText() {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed) return "";
+  const text = selection.toString().trim();
+  if (!text) return "";
+  const anchor = selection.anchorNode && (selection.anchorNode.nodeType === Node.ELEMENT_NODE
+    ? selection.anchorNode
+    : selection.anchorNode.parentElement);
+  const focus = selection.focusNode && (selection.focusNode.nodeType === Node.ELEMENT_NODE
+    ? selection.focusNode
+    : selection.focusNode.parentElement);
+  if (!anchor || !focus) return "";
+  if (!els.conversationList.contains(anchor) || !els.conversationList.contains(focus)) return "";
+  return text;
+}
+
+function showNoteContextMenu(event, text) {
+  state.noteContextText = text;
+  const menu = els.noteContextMenu;
+  menu.hidden = false;
+  const rect = menu.getBoundingClientRect();
+  const left = clamp(event.clientX, 8, window.innerWidth - rect.width - 8);
+  const top = clamp(event.clientY, 8, window.innerHeight - rect.height - 8);
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
+}
+
+function hideNoteContextMenu() {
+  state.noteContextText = "";
+  els.noteContextMenu.hidden = true;
+}
+
+async function appendSelectionToNote() {
+  const node = selectedNode();
+  const text = state.noteContextText.trim();
+  hideNoteContextMenu();
+  if (!node || !text) return;
+  const res = await fetch(`/api/nodes/${node.id}/note/append`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    window.alert(data.error || "追加失败");
+    return;
+  }
+  state.activeSideTab = "notes";
+  state.noteDirty = false;
+  state.noteDraftNodeId = data.node.id;
+  state.noteDraft = data.node.note_md || "";
+  await fetchTree();
+}
+
 async function patchSelected(payload) {
   const node = selectedNode();
   if (!node) return;
@@ -1431,6 +1715,30 @@ function pollIfNeeded() {
 
 function wireEvents() {
   els.composer.addEventListener("submit", sendPrompt);
+  for (const button of els.sideTabBtns) {
+    button.addEventListener("click", () => setSideTab(button.dataset.sideTab));
+  }
+  els.noteEditor.addEventListener("input", () => {
+    const node = selectedNode();
+    state.noteDraftNodeId = node ? node.id : null;
+    state.noteDraft = els.noteEditor.value;
+    state.noteDirty = Boolean(node);
+    renderNotePanel();
+  });
+  els.noteSaveBtn.addEventListener("click", saveNote);
+  els.noteProjectBtn.addEventListener("click", readProjectNotes);
+  els.conversationList.addEventListener("contextmenu", (event) => {
+    const text = selectedConversationText();
+    if (!text || !selectedNode()) return;
+    event.preventDefault();
+    showNoteContextMenu(event, text);
+  });
+  els.noteContextAppendBtn.addEventListener("click", appendSelectionToNote);
+  document.addEventListener("click", (event) => {
+    if (!els.noteContextMenu.hidden && !els.noteContextMenu.contains(event.target)) {
+      hideNoteContextMenu();
+    }
+  });
   els.sideResizeHandle.addEventListener("pointerdown", startSidePanelResize);
   window.addEventListener("pointermove", resizeSidePanel);
   window.addEventListener("pointerup", stopSidePanelResize);
@@ -1441,6 +1749,14 @@ function wireEvents() {
   els.workspacePreviewCloseBtn.addEventListener("click", closeWorkspacePreview);
   window.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !els.workspacePreview.hidden) closeWorkspacePreview();
+    if (event.key === "Escape") {
+      hideNoteContextMenu();
+      hideNodeNotePreview();
+    }
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s" && state.activeSideTab === "notes") {
+      event.preventDefault();
+      saveNote();
+    }
   });
   els.promptInput.addEventListener("dragover", handlePromptDragOver);
   els.promptInput.addEventListener("dragleave", () => els.promptInput.classList.remove("drop-target"));
