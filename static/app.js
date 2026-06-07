@@ -84,6 +84,7 @@ const els = {
   noteContextMenu: document.getElementById("noteContextMenu"),
   noteContextAppendBtn: document.getElementById("noteContextAppendBtn"),
   nodeNotePreview: document.getElementById("nodeNotePreview"),
+  nodePromptPreview: document.getElementById("nodePromptPreview"),
   deleteBtn: document.getElementById("deleteBtn"),
   exportBtn: document.getElementById("exportBtn"),
   fileInput: document.getElementById("fileInput"),
@@ -723,8 +724,38 @@ function hideNodeNotePreview() {
   els.nodeNotePreview.hidden = true;
 }
 
+function positionNodePromptPreview(target) {
+  const rect = target.getBoundingClientRect();
+  const preview = els.nodePromptPreview;
+  const margin = 10;
+  const width = preview.offsetWidth || 360;
+  const height = preview.offsetHeight || 220;
+  const left = clamp(rect.left, margin, window.innerWidth - width - margin);
+  let top = rect.bottom + 8;
+  if (top + height > window.innerHeight - margin) {
+    top = rect.top - height - 8;
+  }
+  preview.style.left = `${left}px`;
+  preview.style.top = `${clamp(top, margin, window.innerHeight - height - margin)}px`;
+}
+
+function showNodePromptPreview(node, target) {
+  const prompt = String(node.prompt || "").trim();
+  if (!prompt) return;
+  const pre = document.createElement("pre");
+  pre.textContent = prompt;
+  els.nodePromptPreview.replaceChildren(pre);
+  els.nodePromptPreview.hidden = false;
+  positionNodePromptPreview(target);
+}
+
+function hideNodePromptPreview() {
+  els.nodePromptPreview.hidden = true;
+}
+
 function openNodeNote(nodeId) {
   state.activeSideTab = "notes";
+  hideNodePromptPreview();
   selectNode(nodeId);
 }
 
@@ -741,7 +772,18 @@ function makeNodeCard(node) {
     .join(" ");
   card.style.setProperty("--node-color", colorFor(node));
   card.dataset.nodeId = node.id;
-  card.title = node.prompt || "";
+  card.addEventListener("mouseenter", (event) => {
+    if (event.target.closest && event.target.closest(".node-note-button")) return;
+    showNodePromptPreview(node, card);
+  });
+  card.addEventListener("mousemove", (event) => {
+    if (event.target.closest && event.target.closest(".node-note-button")) {
+      hideNodePromptPreview();
+      return;
+    }
+    positionNodePromptPreview(card);
+  });
+  card.addEventListener("mouseleave", hideNodePromptPreview);
 
   const top = document.createElement("div");
   top.className = "node-top";
@@ -758,12 +800,11 @@ function makeNodeCard(node) {
     noteButton.setAttribute("title", "");
     noteButton.textContent = "✎";
     noteButton.addEventListener("mouseenter", (event) => {
-      card.removeAttribute("title");
+      hideNodePromptPreview();
       showNodeNotePreview(node, event.currentTarget);
     });
     noteButton.addEventListener("mousemove", (event) => positionNodeNotePreview(event.currentTarget));
     noteButton.addEventListener("mouseleave", () => {
-      card.title = node.prompt || "";
       hideNodeNotePreview();
     });
     noteButton.addEventListener("click", (event) => {
@@ -810,6 +851,8 @@ function makeNodeCard(node) {
 }
 
 function selectNode(id) {
+  hideNodePromptPreview();
+  hideNodeNotePreview();
   state.selectedId = id;
   state.parentId = id;
   render();
@@ -1752,6 +1795,7 @@ function wireEvents() {
     if (event.key === "Escape") {
       hideNoteContextMenu();
       hideNodeNotePreview();
+      hideNodePromptPreview();
     }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s" && state.activeSideTab === "notes") {
       event.preventDefault();

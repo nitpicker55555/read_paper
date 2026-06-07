@@ -1200,6 +1200,26 @@ pre {
   line-height: 18px;
 }
 
+.node-prompt-preview {
+  position: fixed;
+  z-index: 24;
+  width: min(420px, calc(100vw - 20px));
+  max-height: min(420px, calc(100vh - 20px));
+  padding: 10px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fffdfa;
+  box-shadow: var(--shadow);
+  color: var(--text);
+}
+
+.node-prompt-preview pre {
+  color: var(--text);
+  font-size: 12px;
+  line-height: 18px;
+}
+
 @keyframes agentPulse {
   0%,
   100% {
