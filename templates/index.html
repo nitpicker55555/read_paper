@@ -36,6 +36,20 @@
 
       <main class="main-layout">
         <section class="canvas-column">
+          <aside id="workspaceDrawer" class="workspace-drawer collapsed">
+            <button id="workspaceToggleBtn" class="workspace-toggle" type="button" title="展开 Workspace" aria-label="展开 Workspace">W</button>
+            <div class="workspace-drawer-body">
+              <div class="panel-heading">
+                <h2>Workspace</h2>
+                <div class="panel-actions">
+                  <button id="workspaceCollapseBtn" class="icon-button" type="button" title="折叠 Workspace">‹</button>
+                  <button id="workspaceRefreshBtn" class="icon-button" type="button" title="刷新 Workspace">↻</button>
+                </div>
+              </div>
+              <div id="workspaceFileList" class="workspace-file-list"></div>
+            </div>
+          </aside>
+
           <div id="canvasHost" class="canvas-host">
             <svg id="treeSvg" role="img" aria-label="Codex 问答树">
               <defs>
@@ -97,6 +111,24 @@
           </form>
         </aside>
       </main>
+
+      <div id="workspacePreview" class="workspace-preview" hidden>
+        <button id="workspacePreviewBackdrop" class="workspace-preview-backdrop" type="button" aria-label="关闭预览"></button>
+        <section class="workspace-preview-panel" aria-label="Workspace 文件预览">
+          <header class="workspace-preview-header">
+            <div class="workspace-preview-title">
+              <h2 id="workspacePreviewTitle">Workspace</h2>
+              <span id="workspacePreviewMeta"></span>
+            </div>
+            <div class="panel-actions">
+              <a id="workspaceOpenBtn" class="icon-button" href="#" target="_blank" rel="noopener noreferrer" title="新窗口打开">↗</a>
+              <a id="workspaceDownloadBtn" class="icon-button" href="#" title="下载">⇩</a>
+              <button id="workspacePreviewCloseBtn" class="icon-button" type="button" title="关闭">×</button>
+            </div>
+          </header>
+          <div id="workspacePreviewBody" class="workspace-preview-body"></div>
+        </section>
+      </div>
 
     </div>
 

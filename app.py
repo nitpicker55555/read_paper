@@ -34,9 +34,32 @@ CODEX_AUTH_FILE = Path(
 USER_CONFIG = Path(os.environ.get("CODEX_USER_CONFIG", Path.home() / ".codex" / "config.toml"))
 
 CODEX_TIMEOUT_SECONDS = int(os.environ.get("CODEX_TIMEOUT_SECONDS", "1200"))
-CODEX_MODEL = os.environ.get("CODEX_MODEL", "").strip()
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.5").strip() or "gpt-5.5"
+CODEX_REASONING_EFFORT = os.environ.get("CODEX_REASONING_EFFORT", "high").strip() or "high"
+CODEX_SERVICE_TIER = os.environ.get("CODEX_SERVICE_TIER", "fast").strip() or "fast"
 MAX_CONTENT_LENGTH = int(os.environ.get("CODEX_QA_MAX_UPLOAD_MB", "80")) * 1024 * 1024
 TEXT_EXCERPT_BYTES = int(os.environ.get("CODEX_QA_TEXT_EXCERPT_BYTES", "60000"))
+WORKSPACE_TEXT_PREVIEW_BYTES = int(os.environ.get("CODEX_QA_WORKSPACE_TEXT_PREVIEW_BYTES", "524288"))
+WORKSPACE_FILE_LIST_LIMIT = int(os.environ.get("CODEX_QA_WORKSPACE_FILE_LIST_LIMIT", "500"))
+MARKDOWN_EXTENSIONS = {".md", ".markdown", ".mdown"}
+TEXT_PREVIEW_EXTENSIONS = {
+    ".csv",
+    ".css",
+    ".html",
+    ".js",
+    ".json",
+    ".jsonl",
+    ".log",
+    ".py",
+    ".rst",
+    ".text",
+    ".toml",
+    ".ts",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
 
 
 app = Flask(__name__)
@@ -104,6 +127,7 @@ def init_db() -> None:
                 total_tokens INTEGER NOT NULL DEFAULT 0,
                 tools_count INTEGER NOT NULL DEFAULT 0,
                 attachments_json TEXT NOT NULL DEFAULT '[]',
+                workspace_refs_json TEXT NOT NULL DEFAULT '[]',
                 raw_events_json TEXT NOT NULL DEFAULT '[]',
                 error TEXT,
                 archived INTEGER NOT NULL DEFAULT 0,
@@ -142,11 +166,26 @@ def init_db() -> None:
                 answer TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS node_workspace_files (
+                node_id TEXT NOT NULL,
+                rel_path TEXT NOT NULL,
+                path TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                mtime REAL NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(node_id, rel_path),
+                FOREIGN KEY(node_id) REFERENCES nodes(id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_nodes_parent_id ON nodes(parent_id);
             CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status);
             CREATE INDEX IF NOT EXISTS idx_files_created_at ON files(created_at);
+            CREATE INDEX IF NOT EXISTS idx_node_workspace_files_node_id ON node_workspace_files(node_id);
             """
         )
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(nodes)").fetchall()}
+        if "workspace_refs_json" not in columns:
+            conn.execute("ALTER TABLE nodes ADD COLUMN workspace_refs_json TEXT NOT NULL DEFAULT '[]'")
 
 
 def rows_to_dicts(rows: Iterable[sqlite3.Row]) -> List[Dict[str, Any]]:
@@ -170,6 +209,7 @@ def compact_title(text: str, limit: int = 44) -> str:
 def public_node(row: sqlite3.Row) -> Dict[str, Any]:
     node = dict(row)
     node["attachments"] = safe_json_loads(node.pop("attachments_json", "[]"), [])
+    node["workspace_refs"] = safe_json_loads(node.pop("workspace_refs_json", "[]"), [])
     node["raw_events"] = safe_json_loads(node.pop("raw_events_json", "[]"), [])
     for internal_key in ("account_name", "account_path", "account_reason"):
         node.pop(internal_key, None)
@@ -201,6 +241,211 @@ def get_files(file_ids: Iterable[str]) -> List[Dict[str, Any]]:
             ids,
         ).fetchall()
     return rows_to_dicts(rows)
+
+
+def path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def workspace_kind(path: Path) -> str:
+    suffix = path.suffix.lower()
+    mime = mimetypes.guess_type(path.name)[0] or ""
+    if suffix in MARKDOWN_EXTENSIONS:
+        return "markdown"
+    if suffix == ".pdf" or mime == "application/pdf":
+        return "pdf"
+    if mime.startswith("text/") or suffix in TEXT_PREVIEW_EXTENSIONS:
+        return "text"
+    return "file"
+
+
+def public_workspace_file(path: Path, source_node: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    workspace_root = WORK_DIR.resolve()
+    stat = path.stat()
+    rel_path = path.resolve().relative_to(workspace_root).as_posix()
+    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    item = {
+        "path": rel_path,
+        "absolute_path": str(path.resolve()),
+        "name": path.name,
+        "dir": str(Path(rel_path).parent) if str(Path(rel_path).parent) != "." else "",
+        "size": stat.st_size,
+        "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "mime": mime,
+        "kind": workspace_kind(path),
+    }
+    if source_node:
+        item["source_node_id"] = source_node.get("id")
+        item["source_title"] = source_node.get("title") or "节点"
+    return item
+
+
+def public_workspace_ref(path: Path) -> Dict[str, Any]:
+    item = public_workspace_file(path)
+    return {
+        "path": item["path"],
+        "absolute_path": item["absolute_path"],
+        "name": item["name"],
+        "mime": item["mime"],
+        "kind": item["kind"],
+        "size": item["size"],
+    }
+
+
+def resolve_workspace_file(value: str) -> Path:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("文件路径不能为空")
+
+    workspace_root = WORK_DIR.resolve()
+    upload_root = UPLOAD_DIR.resolve()
+    candidate = Path(raw)
+    path = candidate.resolve() if candidate.is_absolute() else (workspace_root / raw).resolve()
+
+    if not path_is_within(path, workspace_root):
+        raise ValueError("文件不在 workspace 内")
+    if path_is_within(path, upload_root):
+        raise ValueError("用户上传目录不在 Workspace 文件区中")
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError("文件不存在")
+    return path
+
+
+def normalize_workspace_refs(values: Iterable[Any]) -> List[Dict[str, Any]]:
+    refs: List[Dict[str, Any]] = []
+    seen = set()
+    for value in values:
+        raw = value.get("path") if isinstance(value, dict) else value
+        try:
+            path = resolve_workspace_file(str(raw or ""))
+        except (FileNotFoundError, ValueError):
+            continue
+        rel_path = path.resolve().relative_to(WORK_DIR.resolve()).as_posix()
+        if rel_path in seen:
+            continue
+        seen.add(rel_path)
+        refs.append(public_workspace_ref(path))
+    return refs
+
+
+def workspace_snapshot() -> Dict[str, Tuple[Path, int, float]]:
+    workspace_root = WORK_DIR.resolve()
+    upload_root = UPLOAD_DIR.resolve()
+    if not workspace_root.exists():
+        return {}
+
+    files: Dict[str, Tuple[Path, int, float]] = {}
+    for path in workspace_root.rglob("*"):
+        if not path.is_file():
+            continue
+        resolved = path.resolve()
+        if path_is_within(resolved, upload_root):
+            continue
+        try:
+            stat = resolved.stat()
+            rel_path = resolved.relative_to(workspace_root).as_posix()
+        except OSError:
+            continue
+        files[rel_path] = (resolved, stat.st_size, stat.st_mtime)
+    return files
+
+
+def record_workspace_changes(node_id: str, before: Dict[str, Tuple[Path, int, float]]) -> None:
+    after = workspace_snapshot()
+    changed: List[Tuple[str, str, int, float, str]] = []
+    for rel_path, (path, size, mtime) in after.items():
+        previous = before.get(rel_path)
+        if previous and previous[1] == size and abs(previous[2] - mtime) < 0.001:
+            continue
+        changed.append((node_id, rel_path, str(path), size, mtime, now_iso()))
+
+    if not changed:
+        return
+    with DB_LOCK, db_connection() as conn:
+        conn.executemany(
+            """
+            INSERT INTO node_workspace_files (node_id, rel_path, path, size, mtime, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(node_id, rel_path) DO UPDATE SET
+                path = excluded.path,
+                size = excluded.size,
+                mtime = excluded.mtime,
+                created_at = excluded.created_at
+            """,
+            changed,
+        )
+
+
+def inferred_workspace_files_for_nodes(nodes: List[Dict[str, Any]], known_paths: set[str]) -> List[Dict[str, Any]]:
+    snapshot = workspace_snapshot()
+    workspace_root = WORK_DIR.resolve()
+    inferred: List[Dict[str, Any]] = []
+    for rel_path, (path, _size, mtime) in snapshot.items():
+        if rel_path in known_paths:
+            continue
+        absolute = str((workspace_root / rel_path).resolve())
+        modified = datetime.fromtimestamp(mtime, timezone.utc)
+        source_node = None
+        for node in nodes:
+            text = f"{node.get('prompt') or ''}\n{node.get('answer') or ''}\n{node.get('error') or ''}"
+            if rel_path in text or absolute in text:
+                source_node = node
+            else:
+                start = parse_iso(node.get("created_at"))
+                end = parse_iso(node.get("completed_at") or node.get("updated_at"))
+                if start <= modified <= end:
+                    source_node = node
+            if source_node:
+                break
+        if source_node:
+            inferred.append(public_workspace_file(path, source_node))
+            known_paths.add(rel_path)
+    return inferred
+
+
+def workspace_files_for_node(node_id: Optional[str]) -> List[Dict[str, Any]]:
+    nodes = path_to_node(node_id)
+    if not nodes:
+        return []
+    node_by_id = {node["id"]: node for node in nodes}
+    node_ids = list(node_by_id.keys())
+    placeholders = ",".join("?" for _ in node_ids)
+
+    rows: List[sqlite3.Row] = []
+    if placeholders:
+        with DB_LOCK, db_connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM node_workspace_files
+                WHERE node_id IN ({placeholders})
+                ORDER BY mtime DESC
+                """,
+                node_ids,
+            ).fetchall()
+
+    known_paths: set[str] = set()
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        rel_path = str(row["rel_path"])
+        if rel_path in known_paths:
+            continue
+        known_paths.add(rel_path)
+        try:
+            path = resolve_workspace_file(rel_path)
+        except (FileNotFoundError, ValueError):
+            continue
+        items.append(public_workspace_file(path, node_by_id.get(row["node_id"])))
+
+    items.extend(inferred_workspace_files_for_nodes(nodes, known_paths))
+    items.sort(key=lambda item: item.get("modified_at") or "", reverse=True)
+    return items[:WORKSPACE_FILE_LIST_LIMIT]
 
 
 def path_to_node(node_id: Optional[str]) -> List[Dict[str, Any]]:
@@ -275,6 +520,25 @@ def make_attachment_context(files: List[Dict[str, Any]]) -> str:
     return "\n\n".join(blocks)
 
 
+def make_workspace_ref_context(refs: List[Dict[str, Any]]) -> str:
+    if not refs:
+        return "无"
+    blocks = []
+    for item in refs:
+        blocks.append(
+            "\n".join(
+                [
+                    f"- 文件名: {item.get('name') or Path(item.get('path') or '').name}",
+                    f"  Workspace 相对路径: {item.get('path') or ''}",
+                    f"  本地绝对路径: {item.get('absolute_path') or ''}",
+                    f"  MIME: {item.get('mime') or 'unknown'}",
+                    f"  类型: {item.get('kind') or 'file'}",
+                ]
+            )
+        )
+    return "\n\n".join(blocks)
+
+
 def inherited_attachment_files(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     file_ids: List[str] = []
     seen = set()
@@ -291,7 +555,7 @@ def indent_block(text: str, prefix: str) -> str:
     return "\n".join(prefix + line for line in text.splitlines())
 
 
-def build_codex_prompt(parent_id: Optional[str], prompt: str, files: List[Dict[str, Any]]) -> str:
+def build_codex_prompt(parent_id: Optional[str], prompt: str, files: List[Dict[str, Any]], workspace_refs: List[Dict[str, Any]]) -> str:
     inherited = path_to_node(parent_id)
     inherited_files = inherited_attachment_files(inherited)
     lines = [
@@ -311,6 +575,9 @@ def build_codex_prompt(parent_id: Optional[str], prompt: str, files: List[Dict[s
                     "Assistant:",
                     (node.get("answer") or "").strip() or "(该节点尚无完成回答)",
                     "",
+                    "Workspace 引用:",
+                    make_workspace_ref_context(node.get("workspace_refs") or []),
+                    "",
                 ]
             )
     else:
@@ -325,6 +592,9 @@ def build_codex_prompt(parent_id: Optional[str], prompt: str, files: List[Dict[s
             "## 本次上传附件",
             make_attachment_context(files),
             "",
+            "## 本次 Workspace 引用",
+            make_workspace_ref_context(workspace_refs),
+            "",
             "## 当前用户问题",
             prompt.strip(),
         ]
@@ -332,7 +602,7 @@ def build_codex_prompt(parent_id: Optional[str], prompt: str, files: List[Dict[s
     return "\n".join(lines)
 
 
-def create_node(parent_id: Optional[str], prompt: str, file_ids: List[str]) -> Dict[str, Any]:
+def create_node(parent_id: Optional[str], prompt: str, file_ids: List[str], workspace_refs: List[Dict[str, Any]]) -> Dict[str, Any]:
     if parent_id and not get_node(parent_id):
         raise ValueError("父节点不存在")
 
@@ -354,10 +624,10 @@ def create_node(parent_id: Optional[str], prompt: str, file_ids: List[str]) -> D
         conn.execute(
             """
             INSERT INTO nodes (
-                id, parent_id, title, prompt, status, attachments_json, cwd,
+                id, parent_id, title, prompt, status, attachments_json, workspace_refs_json, cwd,
                 created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
             """,
             (
                 node_id,
@@ -365,6 +635,7 @@ def create_node(parent_id: Optional[str], prompt: str, file_ids: List[str]) -> D
                 compact_title(prompt),
                 prompt,
                 json.dumps(attachments, ensure_ascii=False),
+                json.dumps(workspace_refs, ensure_ascii=False),
                 str(WORK_DIR),
                 created_at,
                 created_at,
@@ -560,11 +831,12 @@ def run_codex_for_node(node_id: str) -> None:
     try:
         account = select_account()
         files = get_files([item["id"] for item in node.get("attachments", [])])
-        prompt_text = build_codex_prompt(node.get("parent_id"), node["prompt"], files)
+        prompt_text = build_codex_prompt(node.get("parent_id"), node["prompt"], files, node.get("workspace_refs") or [])
         codex_home = prepare_codex_home(account)
         run_path = RUN_DIR / node_id
         run_path.mkdir(parents=True, exist_ok=True)
         final_message_path = run_path / "final.md"
+        before_workspace = workspace_snapshot()
 
         update_node(
             node_id,
@@ -578,6 +850,10 @@ def run_codex_for_node(node_id: str) -> None:
         cmd = [
             "codex",
             "--search",
+            "-c",
+            f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"',
+            "-c",
+            f'service_tier="{CODEX_SERVICE_TIER}"',
             "exec",
             "--json",
             "--skip-git-repo-check",
@@ -588,8 +864,7 @@ def run_codex_for_node(node_id: str) -> None:
             "-o",
             str(final_message_path),
         ]
-        if CODEX_MODEL:
-            cmd.extend(["-m", CODEX_MODEL])
+        cmd.extend(["-m", CODEX_MODEL])
         cmd.append("-")
 
         env = os.environ.copy()
@@ -649,6 +924,7 @@ def run_codex_for_node(node_id: str) -> None:
         if not answer:
             answer = extract_answer_from_events(events).strip()
 
+        record_workspace_changes(node_id, before_workspace)
         usage = collect_usage(events, prompt_text, answer or stderr_text)
         session_id = find_first_key(events, ("session_id", "sessionId", "conversation_id"))
         tools_count = collect_tools_count(events)
@@ -864,8 +1140,12 @@ def api_ask() -> Response:
     file_ids = payload.get("file_ids") or []
     if not isinstance(file_ids, list):
         return jsonify({"error": "file_ids 必须是数组"}), 400
+    workspace_refs_payload = payload.get("workspace_refs") or []
+    if not isinstance(workspace_refs_payload, list):
+        return jsonify({"error": "workspace_refs 必须是数组"}), 400
+    workspace_refs = normalize_workspace_refs(workspace_refs_payload)
     try:
-        node = create_node(parent_id, prompt, file_ids)
+        node = create_node(parent_id, prompt, file_ids, workspace_refs)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     start_worker(node["id"])
@@ -889,6 +1169,53 @@ def api_download_file(file_id: str) -> Any:
     if not item:
         return jsonify({"error": "文件不存在"}), 404
     return send_file(item["path"], as_attachment=True, download_name=item["original_name"])
+
+
+@app.get("/api/workspace/files")
+def api_workspace_files() -> Response:
+    node_id = str(request.args.get("node_id") or "").strip() or None
+    return jsonify({"root": str(WORK_DIR), "files": workspace_files_for_node(node_id)})
+
+
+@app.get("/api/workspace/content")
+def api_workspace_content() -> Response:
+    try:
+        path = resolve_workspace_file(str(request.args.get("path") or ""))
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    kind = workspace_kind(path)
+    if kind not in {"markdown", "text"}:
+        return jsonify({"error": "该文件类型不支持文本预览"}), 415
+
+    with path.open("rb") as file_obj:
+        data = file_obj.read(WORKSPACE_TEXT_PREVIEW_BYTES + 1)
+    truncated = len(data) > WORKSPACE_TEXT_PREVIEW_BYTES
+    if truncated:
+        data = data[:WORKSPACE_TEXT_PREVIEW_BYTES]
+    text = data.decode("utf-8", errors="replace")
+    return jsonify({"file": public_workspace_file(path), "content": text, "truncated": truncated})
+
+
+@app.get("/api/workspace/file")
+def api_workspace_file() -> Any:
+    try:
+        path = resolve_workspace_file(str(request.args.get("path") or ""))
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    download = str(request.args.get("download") or "") == "1"
+    return send_file(
+        path,
+        as_attachment=download,
+        download_name=path.name,
+        mimetype=mimetypes.guess_type(path.name)[0] or None,
+        conditional=True,
+    )
 
 
 @app.patch("/api/nodes/<node_id>")
@@ -934,6 +1261,17 @@ def api_delete_node(node_id: str) -> Response:
                 UNION ALL
                 SELECT nodes.id FROM nodes JOIN doomed ON nodes.parent_id = doomed.id
             )
+            DELETE FROM node_workspace_files WHERE node_id IN (SELECT id FROM doomed)
+            """,
+            (node_id,),
+        )
+        conn.execute(
+            """
+            WITH RECURSIVE doomed(id) AS (
+                SELECT ?
+                UNION ALL
+                SELECT nodes.id FROM nodes JOIN doomed ON nodes.parent_id = doomed.id
+            )
             DELETE FROM nodes WHERE id IN (SELECT id FROM doomed)
             """,
             (node_id,),
@@ -960,6 +1298,6 @@ init_db()
 
 if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", "5000"))
+    port = int(os.environ.get("PORT", "8080"))
     debug = os.environ.get("FLASK_DEBUG", "0") == "1"
     app.run(host=host, port=port, debug=debug, use_reloader=False)

@@ -13,11 +13,17 @@ const state = {
   nodes: [],
   projects: [],
   files: [],
+  workspaceFiles: [],
+  workspaceLoading: false,
+  workspaceError: "",
+  workspacePreviewFile: null,
+  workspaceOpen: localStorage.getItem("workspaceDrawerOpen") === "1",
   workDir: "",
   selectedProjectId: localStorage.getItem("selectedProjectId") || null,
   selectedId: null,
   parentId: null,
   fileIds: new Set(),
+  workspaceRefs: [],
   layout: new Map(),
   nodeById: new Map(),
   childrenByParent: new Map(),
@@ -62,6 +68,19 @@ const els = {
   exportBtn: document.getElementById("exportBtn"),
   fileInput: document.getElementById("fileInput"),
   fileList: document.getElementById("fileList"),
+  workspaceDrawer: document.getElementById("workspaceDrawer"),
+  workspaceToggleBtn: document.getElementById("workspaceToggleBtn"),
+  workspaceCollapseBtn: document.getElementById("workspaceCollapseBtn"),
+  workspaceRefreshBtn: document.getElementById("workspaceRefreshBtn"),
+  workspaceFileList: document.getElementById("workspaceFileList"),
+  workspacePreview: document.getElementById("workspacePreview"),
+  workspacePreviewBackdrop: document.getElementById("workspacePreviewBackdrop"),
+  workspacePreviewCloseBtn: document.getElementById("workspacePreviewCloseBtn"),
+  workspacePreviewTitle: document.getElementById("workspacePreviewTitle"),
+  workspacePreviewMeta: document.getElementById("workspacePreviewMeta"),
+  workspacePreviewBody: document.getElementById("workspacePreviewBody"),
+  workspaceOpenBtn: document.getElementById("workspaceOpenBtn"),
+  workspaceDownloadBtn: document.getElementById("workspaceDownloadBtn"),
 };
 
 function svgEl(name) {
@@ -90,6 +109,80 @@ function compact(text, limit = 140) {
   const normalized = String(text || "").replace(/\s+/g, " ").trim();
   if (normalized.length <= limit) return normalized;
   return `${normalized.slice(0, limit - 1)}…`;
+}
+
+function compactFileName(name, head = 10, tail = 12) {
+  const value = String(name || "");
+  if (value.length <= head + tail + 3) return value;
+  return `${value.slice(0, head)}...${value.slice(-tail)}`;
+}
+
+function fileKindForName(name) {
+  const lower = String(name || "").toLowerCase();
+  if (lower.endsWith(".md") || lower.endsWith(".markdown") || lower.endsWith(".mdown")) return "markdown";
+  if (lower.endsWith(".pdf")) return "pdf";
+  if (/\.(txt|csv|json|jsonl|log|py|js|ts|css|html|xml|yaml|yml|toml|rst)$/i.test(lower)) return "text";
+  return "file";
+}
+
+function workspaceFileUrl(fileOrPath, download = false) {
+  const relPath = typeof fileOrPath === "string" ? fileOrPath : fileOrPath.path;
+  const suffix = download ? "&download=1" : "";
+  return `/api/workspace/file?path=${encodeURIComponent(relPath)}${suffix}`;
+}
+
+function workspaceContentUrl(fileOrPath) {
+  const relPath = typeof fileOrPath === "string" ? fileOrPath : fileOrPath.path;
+  return `/api/workspace/content?path=${encodeURIComponent(relPath)}`;
+}
+
+function workspaceRelPathFromHref(href) {
+  const root = String(state.workDir || "").replace(/\/+$/, "");
+  if (!root || !href) return "";
+  const candidates = [];
+  try {
+    candidates.push(decodeURIComponent(String(href)));
+  } catch {
+    candidates.push(String(href));
+  }
+  try {
+    const url = new URL(href, window.location.origin);
+    candidates.push(decodeURIComponent(url.pathname));
+  } catch {
+    // Non-URL workspace paths are handled by the raw candidate.
+  }
+  for (const candidate of candidates) {
+    const normalized = String(candidate || "").replace(/^file:\/+/, "/");
+    if (normalized === root) return "";
+    if (normalized.startsWith(`${root}/`)) return normalized.slice(root.length + 1);
+  }
+  return "";
+}
+
+function workspaceFileForPath(relPath) {
+  const existing = state.workspaceFiles.find((file) => file.path === relPath);
+  if (existing) return existing;
+  const name = relPath.split("/").pop() || relPath;
+  return {
+    path: relPath,
+    name,
+    dir: relPath.includes("/") ? relPath.slice(0, relPath.lastIndexOf("/")) : "",
+    size: 0,
+    modified_at: "",
+    mime: "",
+    kind: fileKindForName(name),
+  };
+}
+
+function workspaceRefFromFile(file) {
+  return {
+    path: file.path,
+    absolute_path: file.absolute_path || (state.workDir ? `${state.workDir.replace(/\/+$/, "")}/${file.path}` : file.path),
+    name: file.name,
+    kind: file.kind || fileKindForName(file.name),
+    mime: file.mime || "",
+    size: Number(file.size || 0),
+  };
 }
 
 function appendInlineMarkdown(parent, text) {
@@ -124,13 +217,24 @@ function appendInlineMarkdown(parent, text) {
       } else {
         const [, label, href] = linkMatch;
         let safeUrl = null;
+        const workspaceRelPath = workspaceRelPathFromHref(href);
         try {
           const url = new URL(href, window.location.origin);
           if (["http:", "https:", "mailto:"].includes(url.protocol)) safeUrl = url.href;
         } catch {
           safeUrl = null;
         }
-        if (!safeUrl) {
+        if (workspaceRelPath) {
+          const link = document.createElement("a");
+          const file = workspaceFileForPath(workspaceRelPath);
+          link.href = workspaceFileUrl(file);
+          link.textContent = label;
+          link.addEventListener("click", (event) => {
+            event.preventDefault();
+            openWorkspaceFile(file).catch((err) => window.alert(err.message));
+          });
+          parent.appendChild(link);
+        } else if (!safeUrl) {
           appendText(label);
         } else {
           const link = document.createElement("a");
@@ -386,10 +490,28 @@ function render() {
   renderConversation();
   renderComposer();
   renderFiles();
+  renderWorkspaceFiles();
+  renderWorkspaceDrawer();
   renderProjectSelect();
   renderDirectionControls();
   els.workspaceLabel.textContent = state.workDir ? state.workDir : "";
   els.emptyState.classList.toggle("visible", state.nodes.length === 0);
+}
+
+function renderWorkspaceDrawer() {
+  if (!els.workspaceDrawer) return;
+  els.workspaceDrawer.classList.toggle("collapsed", !state.workspaceOpen);
+  els.workspaceToggleBtn.setAttribute("aria-label", state.workspaceOpen ? "折叠 Workspace" : "展开 Workspace");
+  els.workspaceToggleBtn.title = state.workspaceOpen ? "折叠 Workspace" : "展开 Workspace";
+}
+
+function setWorkspaceDrawerOpen(open) {
+  state.workspaceOpen = open;
+  localStorage.setItem("workspaceDrawerOpen", open ? "1" : "0");
+  renderWorkspaceDrawer();
+  setTimeout(() => {
+    renderMiniMap();
+  }, 180);
 }
 
 function renderProjectSelect() {
@@ -603,6 +725,7 @@ function selectNode(id) {
   state.selectedId = id;
   state.parentId = id;
   render();
+  fetchWorkspaceFiles().catch(console.error);
 }
 
 function setParent(id) {
@@ -826,7 +949,17 @@ function makeTypingIndicator() {
   return dots;
 }
 
-function makeBubble(role, text, meta = "", tools = [], active = false) {
+function renderWorkspaceRefChips(refs) {
+  if (!refs || !refs.length) return null;
+  const wrap = document.createElement("div");
+  wrap.className = "bubble-ref-list";
+  for (const ref of refs) {
+    wrap.appendChild(makeCompactFileChip(ref, false));
+  }
+  return wrap;
+}
+
+function makeBubble(role, text, meta = "", tools = [], active = false, workspaceRefs = []) {
   const row = document.createElement("div");
   row.className = ["bubble-row", role, active && role === "agent" ? "running" : ""].filter(Boolean).join(" ");
   const bubble = document.createElement("div");
@@ -843,6 +976,8 @@ function makeBubble(role, text, meta = "", tools = [], active = false) {
     const body = document.createElement("pre");
     body.textContent = text || "";
     bubble.appendChild(body);
+    const refs = renderWorkspaceRefChips(workspaceRefs);
+    if (refs) bubble.appendChild(refs);
   }
   if (active && role === "agent") bubble.appendChild(makeTypingIndicator());
   if (meta) {
@@ -888,7 +1023,7 @@ function renderConversation() {
 
   const bubbles = [];
   for (const item of selectedConversationPath()) {
-    bubbles.push(makeBubble("user", item.prompt, item.created_at || ""));
+    bubbles.push(makeBubble("user", item.prompt, item.created_at || "", [], false, item.workspace_refs || []));
     const active = isNodeActive(item);
     const agentText = item.answer || item.error || (active ? "正在处理" : item.status === "done" ? "" : statusText(item.status));
     bubbles.push(makeBubble("agent", agentText, item.completed_at || item.updated_at || "", toolCallsForNode(item), active));
@@ -902,19 +1037,26 @@ function renderComposer() {
   for (const fileId of state.fileIds) {
     const file = state.files.find((item) => item.id === fileId);
     if (!file) continue;
-    const chip = document.createElement("span");
-    chip.className = "file-chip";
-    const name = document.createElement("span");
-    name.textContent = file.original_name;
-    const remove = document.createElement("button");
-    remove.type = "button";
-    remove.textContent = "×";
-    remove.addEventListener("click", () => {
-      state.fileIds.delete(fileId);
+    const chip = makeCompactFileChip(
+      {
+        name: file.original_name,
+        kind: fileKindForName(file.original_name),
+      },
+      true,
+      () => {
+        state.fileIds.delete(fileId);
+        renderComposer();
+        renderFiles();
+      }
+    );
+    els.selectedFiles.appendChild(chip);
+  }
+  for (const ref of state.workspaceRefs) {
+    const chip = makeCompactFileChip(ref, true, () => {
+      state.workspaceRefs = state.workspaceRefs.filter((item) => item.path !== ref.path);
       renderComposer();
-      renderFiles();
     });
-    chip.append(name, remove);
+    chip.classList.add("workspace-ref-chip");
     els.selectedFiles.appendChild(chip);
   }
   els.sendBtn.disabled = state.sending;
@@ -932,19 +1074,224 @@ function renderFiles() {
   const rows = files.map((file) => {
     const row = document.createElement("div");
     row.className = "file-row";
-    const main = document.createElement("div");
-    main.className = "file-main";
-    const name = document.createElement("div");
+    row.title = file.original_name;
+    const icon = document.createElement("span");
+    icon.className = "file-icon";
+    icon.textContent = compactFileIcon(file);
+    const name = document.createElement("span");
     name.className = "file-name";
-    name.textContent = file.original_name;
-    const sub = document.createElement("div");
-    sub.className = "file-sub";
-    sub.textContent = [`来自 ${compact(file.source_title, 28)}`, formatBytes(file.size), file.mime || "unknown"].join(" · ");
-    main.append(name, sub);
-    row.appendChild(main);
+    name.textContent = compactFileName(file.original_name);
+    row.append(icon, name);
     return row;
   });
   els.fileList.replaceChildren(...rows);
+}
+
+function workspaceIcon(file) {
+  if (file.kind === "markdown") return "MD";
+  if (file.kind === "pdf") return "PDF";
+  if (file.kind === "text") return "TXT";
+  return "FILE";
+}
+
+function compactFileIcon(file) {
+  const kind = file.kind || fileKindForName(file.original_name || file.name);
+  if (kind === "markdown") return "M";
+  if (kind === "pdf") return "P";
+  if (kind === "text") return "T";
+  return "F";
+}
+
+function makeCompactFileChip(file, removable = false, onRemove = null) {
+  const chip = document.createElement("span");
+  chip.className = "file-chip compact-file-chip";
+  chip.title = file.name || file.original_name || "";
+  const icon = document.createElement("span");
+  icon.className = "file-icon";
+  icon.textContent = compactFileIcon(file);
+  const name = document.createElement("span");
+  name.textContent = compactFileName(file.name || file.original_name || "");
+  chip.append(icon, name);
+  if (removable) {
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "×";
+    remove.addEventListener("click", onRemove);
+    chip.appendChild(remove);
+  }
+  return chip;
+}
+
+function renderWorkspaceFiles() {
+  if (!els.workspaceFileList) return;
+  if (state.workspaceLoading) {
+    const loading = document.createElement("div");
+    loading.className = "soft-label";
+    loading.textContent = "正在读取 Workspace";
+    els.workspaceFileList.replaceChildren(loading);
+    return;
+  }
+  if (state.workspaceError) {
+    const error = document.createElement("div");
+    error.className = "soft-label error-label";
+    error.textContent = state.workspaceError;
+    els.workspaceFileList.replaceChildren(error);
+    return;
+  }
+  if (!state.workspaceFiles.length) {
+    const empty = document.createElement("div");
+    empty.className = "soft-label";
+    empty.textContent = "暂无 Workspace 文件";
+    els.workspaceFileList.replaceChildren(empty);
+    return;
+  }
+
+  const rows = state.workspaceFiles.map((file) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "workspace-file-row";
+    button.draggable = true;
+    const icon = document.createElement("span");
+    icon.className = `workspace-file-icon kind-${file.kind || "file"}`;
+    icon.textContent = workspaceIcon(file);
+    const main = document.createElement("span");
+    main.className = "workspace-file-main";
+    const name = document.createElement("span");
+    name.className = "workspace-file-name";
+    name.textContent = file.name;
+    const sub = document.createElement("span");
+    sub.className = "workspace-file-sub";
+    sub.textContent = [
+      file.source_title ? `来自 ${compact(file.source_title, 22)}` : "",
+      file.dir || "workspace",
+      formatBytes(file.size),
+      file.modified_at || "",
+    ].filter(Boolean).join(" · ");
+    main.append(name, sub);
+    button.append(icon, main);
+    button.addEventListener("dragstart", (event) => {
+      const reference = workspaceRefFromFile(file);
+      event.dataTransfer.effectAllowed = "copy";
+      event.dataTransfer.setData("application/x-workspace-ref", JSON.stringify(reference));
+      event.dataTransfer.setData("text/plain", file.name);
+      event.dataTransfer.setData("text/uri-list", file.absolute_path || file.path);
+    });
+    button.addEventListener("click", () => {
+      openWorkspaceFile(file).catch((err) => window.alert(err.message));
+    });
+    return button;
+  });
+  els.workspaceFileList.replaceChildren(...rows);
+}
+
+function closeWorkspacePreview() {
+  state.workspacePreviewFile = null;
+  els.workspacePreview.hidden = true;
+  els.workspacePreviewBody.replaceChildren();
+}
+
+function renderWorkspacePreviewShell(file) {
+  state.workspacePreviewFile = file;
+  els.workspacePreview.hidden = false;
+  els.workspacePreviewTitle.textContent = file.name;
+  els.workspacePreviewMeta.textContent = [file.path, formatBytes(file.size), file.mime || ""].filter(Boolean).join(" · ");
+  els.workspaceOpenBtn.href = workspaceFileUrl(file);
+  els.workspaceDownloadBtn.href = workspaceFileUrl(file, true);
+  const loading = document.createElement("div");
+  loading.className = "workspace-preview-loading";
+  loading.textContent = "正在加载";
+  els.workspacePreviewBody.replaceChildren(loading);
+}
+
+async function openWorkspaceFile(file) {
+  renderWorkspacePreviewShell(file);
+
+  if (file.kind === "markdown" || file.kind === "text") {
+    const res = await fetch(workspaceContentUrl(file));
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "读取文件失败");
+    const body = document.createElement("div");
+    if (file.kind === "markdown") {
+      body.className = "workspace-markdown-preview";
+      body.appendChild(renderMarkdown(data.content || ""));
+    } else {
+      const pre = document.createElement("pre");
+      pre.className = "workspace-text-preview";
+      pre.textContent = data.content || "";
+      body.appendChild(pre);
+    }
+    if (data.truncated) {
+      const notice = document.createElement("div");
+      notice.className = "preview-notice";
+      notice.textContent = "文件较大，仅显示前半部分内容";
+      body.appendChild(notice);
+    }
+    els.workspacePreviewBody.replaceChildren(body);
+    return;
+  }
+
+  if (file.kind === "pdf") {
+    const frame = document.createElement("iframe");
+    frame.className = "workspace-pdf-preview";
+    frame.src = workspaceFileUrl(file);
+    frame.title = file.name;
+    els.workspacePreviewBody.replaceChildren(frame);
+    return;
+  }
+
+  const fallback = document.createElement("div");
+  fallback.className = "workspace-file-fallback";
+  fallback.textContent = "该文件类型暂不支持内嵌预览，可以新窗口打开或下载。";
+  els.workspacePreviewBody.replaceChildren(fallback);
+}
+
+async function fetchWorkspaceFiles() {
+  if (!els.workspaceFileList) return;
+  const selectedId = state.selectedId;
+  if (!selectedId) {
+    state.workspaceFiles = [];
+    state.workspaceLoading = false;
+    state.workspaceError = "";
+    renderWorkspaceFiles();
+    return;
+  }
+  state.workspaceLoading = true;
+  state.workspaceError = "";
+  renderWorkspaceFiles();
+  try {
+    const res = await fetch(`/api/workspace/files?node_id=${encodeURIComponent(selectedId)}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "读取 Workspace 失败");
+    if (selectedId !== state.selectedId) return;
+    state.workspaceFiles = data.files || [];
+  } catch (err) {
+    state.workspaceError = err.message;
+  } finally {
+    state.workspaceLoading = false;
+    renderWorkspaceFiles();
+  }
+}
+
+function handlePromptDragOver(event) {
+  if (!Array.from(event.dataTransfer.types || []).includes("text/plain")) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = "copy";
+  els.promptInput.classList.add("drop-target");
+}
+
+function handlePromptDrop(event) {
+  const rawRef = event.dataTransfer.getData("application/x-workspace-ref");
+  if (!rawRef) return;
+  event.preventDefault();
+  els.promptInput.classList.remove("drop-target");
+  try {
+    const ref = JSON.parse(rawRef);
+    if (!ref.path || state.workspaceRefs.some((item) => item.path === ref.path)) return;
+    state.workspaceRefs.push(ref);
+    renderComposer();
+  } catch (err) {
+    window.alert(err.message);
+  }
 }
 
 function renderDirectionControls() {
@@ -967,6 +1314,7 @@ async function sendPrompt(event) {
         parent_id: state.parentId,
         prompt,
         file_ids: [...state.fileIds],
+        workspace_refs: state.workspaceRefs.map((item) => ({ path: item.path })),
       }),
     });
     const data = await res.json();
@@ -978,9 +1326,11 @@ async function sendPrompt(event) {
       localStorage.setItem("selectedProjectId", state.selectedProjectId);
     }
     state.fileIds.clear();
+    state.workspaceRefs = [];
     els.promptInput.value = "";
     await fetchTree();
     focusSelected();
+    await fetchWorkspaceFiles();
   } catch (err) {
     window.alert(err.message);
   } finally {
@@ -1050,6 +1400,7 @@ async function deleteSelected() {
   localStorage.setItem("selectedProjectId", state.selectedProjectId);
   await fetchTree();
   focusSelected();
+  await fetchWorkspaceFiles();
 }
 
 function rootIdForNode(nodeId) {
@@ -1109,16 +1460,21 @@ function startNewProject() {
   state.selectedProjectId = "__new__";
   state.parentId = null;
   state.selectedId = null;
+  state.workspaceFiles = [];
   state.nodes = [];
   localStorage.setItem("selectedProjectId", state.selectedProjectId);
   rebuildIndexes();
   render();
+  fetchWorkspaceFiles().catch(console.error);
   els.promptInput.focus();
 }
 
 function pollIfNeeded() {
   const active = state.allNodes.some((node) => node.status === "running" || node.status === "queued");
-  if (active) fetchTree().catch(console.error);
+  if (active) {
+    fetchTree().catch(console.error);
+    fetchWorkspaceFiles().catch(console.error);
+  }
 }
 
 function wireEvents() {
@@ -1126,6 +1482,17 @@ function wireEvents() {
   els.sideResizeHandle.addEventListener("pointerdown", startSidePanelResize);
   window.addEventListener("pointermove", resizeSidePanel);
   window.addEventListener("pointerup", stopSidePanelResize);
+  els.workspaceToggleBtn.addEventListener("click", () => setWorkspaceDrawerOpen(!state.workspaceOpen));
+  els.workspaceCollapseBtn.addEventListener("click", () => setWorkspaceDrawerOpen(false));
+  els.workspaceRefreshBtn.addEventListener("click", () => fetchWorkspaceFiles().catch(console.error));
+  els.workspacePreviewBackdrop.addEventListener("click", closeWorkspacePreview);
+  els.workspacePreviewCloseBtn.addEventListener("click", closeWorkspacePreview);
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !els.workspacePreview.hidden) closeWorkspacePreview();
+  });
+  els.promptInput.addEventListener("dragover", handlePromptDragOver);
+  els.promptInput.addEventListener("dragleave", () => els.promptInput.classList.remove("drop-target"));
+  els.promptInput.addEventListener("drop", handlePromptDrop);
   els.promptInput.addEventListener("keydown", (event) => {
     if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
     event.preventDefault();
@@ -1162,11 +1529,15 @@ function wireEvents() {
     rebuildIndexes();
     render();
     focusSelected();
+    fetchWorkspaceFiles().catch(console.error);
   });
   els.emptyState.addEventListener("click", () => {
     els.promptInput.focus();
   });
-  els.refreshBtn.addEventListener("click", () => fetchTree().catch(console.error));
+  els.refreshBtn.addEventListener("click", () => {
+    fetchTree().catch(console.error);
+    fetchWorkspaceFiles().catch(console.error);
+  });
   els.focusBtn.addEventListener("click", focusSelected);
   els.zoomInBtn.addEventListener("click", () => {
     const rect = els.canvasHost.getBoundingClientRect();
@@ -1221,6 +1592,7 @@ wireEvents();
 fetchTree({ keepSelection: false })
   .then(() => {
     if (state.nodes.length) focusSelected();
+    return fetchWorkspaceFiles();
   })
   .catch((err) => {
     window.alert(err.message);
