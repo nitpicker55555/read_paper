@@ -602,12 +602,6 @@ pre {
   overflow: hidden;
 }
 
-.compact-file-chip.workspace-ref-chip {
-  border-color: #c6d5e4;
-  background: #f2f7fb;
-  color: #315c8f;
-}
-
 .file-chip span {
   min-width: 0;
   overflow: hidden;

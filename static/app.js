@@ -949,8 +949,15 @@ function makeTypingIndicator() {
   return dots;
 }
 
-function renderWorkspaceRefChips(refs) {
-  if (!refs || !refs.length) return null;
+function renderReferenceChips(attachments = [], workspaceRefs = []) {
+  const refs = [
+    ...attachments.map((item) => ({
+      name: item.name || item.original_name || "",
+      kind: fileKindForName(item.name || item.original_name || ""),
+    })),
+    ...workspaceRefs,
+  ];
+  if (!refs.length) return null;
   const wrap = document.createElement("div");
   wrap.className = "bubble-ref-list";
   for (const ref of refs) {
@@ -959,7 +966,7 @@ function renderWorkspaceRefChips(refs) {
   return wrap;
 }
 
-function makeBubble(role, text, meta = "", tools = [], active = false, workspaceRefs = []) {
+function makeBubble(role, text, meta = "", tools = [], active = false, attachments = [], workspaceRefs = []) {
   const row = document.createElement("div");
   row.className = ["bubble-row", role, active && role === "agent" ? "running" : ""].filter(Boolean).join(" ");
   const bubble = document.createElement("div");
@@ -976,7 +983,7 @@ function makeBubble(role, text, meta = "", tools = [], active = false, workspace
     const body = document.createElement("pre");
     body.textContent = text || "";
     bubble.appendChild(body);
-    const refs = renderWorkspaceRefChips(workspaceRefs);
+    const refs = renderReferenceChips(attachments, workspaceRefs);
     if (refs) bubble.appendChild(refs);
   }
   if (active && role === "agent") bubble.appendChild(makeTypingIndicator());
@@ -1023,7 +1030,7 @@ function renderConversation() {
 
   const bubbles = [];
   for (const item of selectedConversationPath()) {
-    bubbles.push(makeBubble("user", item.prompt, item.created_at || "", [], false, item.workspace_refs || []));
+    bubbles.push(makeBubble("user", item.prompt, item.created_at || "", [], false, item.attachments || [], item.workspace_refs || []));
     const active = isNodeActive(item);
     const agentText = item.answer || item.error || (active ? "正在处理" : item.status === "done" ? "" : statusText(item.status));
     bubbles.push(makeBubble("agent", agentText, item.completed_at || item.updated_at || "", toolCallsForNode(item), active));
@@ -1056,7 +1063,6 @@ function renderComposer() {
       state.workspaceRefs = state.workspaceRefs.filter((item) => item.path !== ref.path);
       renderComposer();
     });
-    chip.classList.add("workspace-ref-chip");
     els.selectedFiles.appendChild(chip);
   }
   els.sendBtn.disabled = state.sending;
