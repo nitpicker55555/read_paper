@@ -908,6 +908,7 @@ function makeNodeCard(node) {
     badges.appendChild(badge);
   }
   const status = document.createElement("span");
+  status.className = "node-status-label";
   status.textContent = statusText(node.status);
   bottom.append(badges, status);
   const content = document.createElement("div");

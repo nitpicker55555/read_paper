@@ -454,9 +454,9 @@ pre {
 }
 
 .node-top {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 12px;
   align-items: center;
-  justify-content: space-between;
   gap: 8px;
 }
 
@@ -475,7 +475,9 @@ pre {
   display: flex;
   flex: 0 0 auto;
   align-items: center;
+  justify-content: flex-end;
   gap: 6px;
+  min-width: 12px;
 }
 
 .node-note-button {
@@ -570,10 +572,11 @@ pre {
 }
 
 .node-bottom {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  justify-content: space-between;
   gap: 8px;
+  min-width: 0;
   color: var(--muted-2);
   font-size: 11px;
 }
@@ -582,12 +585,22 @@ pre {
   display: flex;
   min-width: 0;
   gap: 6px;
+  overflow: hidden;
 }
 
 .badge {
   max-width: 72px;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-status-label {
+  min-width: 24px;
+  flex: 0 0 auto;
+  color: var(--muted);
+  text-align: right;
   white-space: nowrap;
 }
 

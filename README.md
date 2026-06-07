@@ -2,6 +2,8 @@
 
 一个 Flask 版 Codex 问答前后端。每一轮 `user -> assistant` 是树上的一个节点，可以从任意节点继续发问，新的回答会成为该节点的子节点，因此同一节点可以并行 fork 多条会话。
 
+![Codex Tree QA 界面截图](img.png)
+
 ## 运行
 
 ```bash
@@ -11,7 +13,7 @@ pip install -r requirements.txt
 python app.py
 ```
 
-默认地址是 <http://127.0.0.1:5000>。
+默认地址是 <http://127.0.0.1:8080>，局域网内可通过本机 IP 的 8080 端口访问。
 
 ## 配置
 
@@ -27,7 +29,7 @@ python app.py
 CODEX_AUTH_FILE=/path/to/auth.json
 CODEX_MODEL=gpt-5.5
 CODEX_TIMEOUT_SECONDS=1200
-PORT=5000
+PORT=8080
 ```
 
 账号逻辑：
