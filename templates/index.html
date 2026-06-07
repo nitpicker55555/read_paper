@@ -114,13 +114,14 @@
               <span id="noteStatus" class="note-status">节点笔记</span>
               <div class="panel-actions">
                 <button id="noteProjectBtn" class="icon-button" type="button" title="读取当前项目所有节点的笔记">☷</button>
-                <button id="noteSaveBtn" class="icon-button" type="button" title="保存笔记">✓</button>
+                <button id="noteEditBtn" class="icon-button" type="button" title="编辑笔记">笔</button>
+                <button id="noteSaveBtn" class="icon-button" type="button" title="保存笔记" hidden>✓</button>
               </div>
             </div>
-            <div id="noteEditorWrap" class="note-editor-wrap">
-              <textarea id="noteEditor" rows="8" placeholder="笔记"></textarea>
+            <div id="noteBox" class="note-box">
+              <textarea id="noteEditor" rows="8" placeholder="笔记" hidden></textarea>
+              <div id="noteRendered" class="note-rendered"></div>
             </div>
-            <div id="noteRendered" class="note-rendered"></div>
           </section>
         </aside>
       </main>

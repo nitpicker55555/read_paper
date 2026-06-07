@@ -1,5 +1,6 @@
 const NODE_W = 238;
 const NODE_H = 112;
+const NODE_OVERFLOW = 18;
 const X_GAP = 330;
 const Y_GAP = 150;
 const PALETTE = ["#287c74", "#b6542f", "#3a6ea5", "#6f7d51", "#9b4d68", "#7a6840", "#2f7d51", "#8c5b2e"];
@@ -42,6 +43,7 @@ const state = {
   noteDraft: "",
   noteDirty: false,
   noteSaving: false,
+  noteEditing: false,
   projectNotes: [],
   projectNotesProjectId: null,
   noteContextText: "",
@@ -77,8 +79,9 @@ const els = {
   notePane: document.getElementById("notePane"),
   noteStatus: document.getElementById("noteStatus"),
   noteProjectBtn: document.getElementById("noteProjectBtn"),
+  noteEditBtn: document.getElementById("noteEditBtn"),
   noteSaveBtn: document.getElementById("noteSaveBtn"),
-  noteEditorWrap: document.getElementById("noteEditorWrap"),
+  noteBox: document.getElementById("noteBox"),
   noteEditor: document.getElementById("noteEditor"),
   noteRendered: document.getElementById("noteRendered"),
   noteContextMenu: document.getElementById("noteContextMenu"),
@@ -680,11 +683,13 @@ function renderTree() {
     const pos = state.layout.get(node.id);
     if (!pos) continue;
     const foreign = svgEl("foreignObject");
-    foreign.setAttribute("x", pos.x);
-    foreign.setAttribute("y", pos.y);
-    foreign.setAttribute("width", NODE_W);
-    foreign.setAttribute("height", NODE_H);
-    foreign.appendChild(makeNodeCard(node));
+    foreign.setAttribute("x", pos.x - NODE_OVERFLOW);
+    foreign.setAttribute("y", pos.y - NODE_OVERFLOW);
+    foreign.setAttribute("width", NODE_W + NODE_OVERFLOW * 2);
+    foreign.setAttribute("height", NODE_H + NODE_OVERFLOW * 2);
+    const card = makeNodeCard(node);
+    card.style.margin = `${NODE_OVERFLOW}px`;
+    foreign.appendChild(card);
     els.nodeLayer.appendChild(foreign);
   }
 }
@@ -711,17 +716,21 @@ function positionNodeNotePreview(target) {
 }
 
 function showNodeNotePreview(node, target) {
-  const note = firstLines(node.note_md || "", 10);
+  const note = firstLines(noteTextForNode(node), 10);
   if (!note) return;
-  const pre = document.createElement("pre");
-  pre.textContent = note;
-  els.nodeNotePreview.replaceChildren(pre);
+  els.nodeNotePreview.replaceChildren(renderMarkdown(note));
   els.nodeNotePreview.hidden = false;
   positionNodeNotePreview(target);
 }
 
 function hideNodeNotePreview() {
   els.nodeNotePreview.hidden = true;
+}
+
+function noteTextForNode(node) {
+  if (!node) return "";
+  if (state.noteDraftNodeId === node.id) return state.noteDraft || "";
+  return node.note_md || "";
 }
 
 function positionNodePromptPreview(target) {
@@ -785,20 +794,14 @@ function makeNodeCard(node) {
   });
   card.addEventListener("mouseleave", hideNodePromptPreview);
 
-  const top = document.createElement("div");
-  top.className = "node-top";
-  const title = document.createElement("div");
-  title.className = "node-title";
-  title.textContent = node.title || "节点";
-  const markers = document.createElement("div");
-  markers.className = "node-markers";
-  if (String(node.note_md || "").trim()) {
+  const noteText = String(noteTextForNode(node)).trim();
+  if (noteText) {
     const noteButton = document.createElement("button");
     noteButton.type = "button";
     noteButton.className = "node-note-button";
     noteButton.setAttribute("aria-label", "笔记");
     noteButton.setAttribute("title", "");
-    noteButton.textContent = "✎";
+    noteButton.textContent = "笔";
     noteButton.addEventListener("mouseenter", (event) => {
       hideNodePromptPreview();
       showNodeNotePreview(node, event.currentTarget);
@@ -812,8 +815,16 @@ function makeNodeCard(node) {
       hideNodeNotePreview();
       openNodeNote(node.id);
     });
-    markers.appendChild(noteButton);
+    card.appendChild(noteButton);
   }
+
+  const top = document.createElement("div");
+  top.className = "node-top";
+  const title = document.createElement("div");
+  title.className = "node-title";
+  title.textContent = node.title || "节点";
+  const markers = document.createElement("div");
+  markers.className = "node-markers";
   const dot = document.createElement("span");
   dot.className = `status-dot status-${node.status || "queued"}`;
   markers.appendChild(dot);
@@ -837,7 +848,10 @@ function makeNodeCard(node) {
   const status = document.createElement("span");
   status.textContent = statusText(node.status);
   bottom.append(badges, status);
-  card.append(top, snippet, bottom);
+  const content = document.createElement("div");
+  content.className = "node-content";
+  content.append(top, snippet, bottom);
+  card.appendChild(content);
 
   card.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -1124,12 +1138,14 @@ function ensureNoteDraft(node) {
     state.noteDraftNodeId = null;
     state.noteDraft = "";
     state.noteDirty = false;
+    state.noteEditing = false;
     return;
   }
   if (state.noteDraftNodeId !== node.id) {
     state.noteDraftNodeId = node.id;
     state.noteDraft = node.note_md || "";
     state.noteDirty = false;
+    state.noteEditing = false;
     state.projectNotes = [];
     state.projectNotesProjectId = null;
   }
@@ -1172,7 +1188,10 @@ function renderNotePanel() {
   ensureNoteDraft(node);
   const disabled = !node;
   els.noteEditor.disabled = disabled || state.noteSaving;
-  els.noteSaveBtn.disabled = disabled || state.noteSaving;
+  els.noteEditBtn.disabled = disabled || state.noteSaving;
+  els.noteSaveBtn.disabled = disabled || state.noteSaving || !state.noteEditing;
+  els.noteEditBtn.hidden = disabled || state.noteEditing;
+  els.noteSaveBtn.hidden = disabled || !state.noteEditing;
   els.noteProjectBtn.disabled = !state.selectedProjectId || state.selectedProjectId === "__new__";
   els.noteStatus.textContent = disabled
     ? "say something"
@@ -1180,10 +1199,14 @@ function renderNotePanel() {
       ? "保存中"
       : state.noteDirty
         ? "节点笔记未保存"
-        : "节点笔记";
+        : state.noteEditing
+          ? "编辑笔记"
+          : "节点笔记";
   if (els.noteEditor.value !== state.noteDraft) {
     els.noteEditor.value = state.noteDraft;
   }
+  els.noteEditor.hidden = !state.noteEditing;
+  els.noteRendered.hidden = state.noteEditing;
 
   const rendered = document.createElement("div");
   rendered.className = "note-preview-section";
@@ -1240,7 +1263,6 @@ function renderConversation() {
     bubbles.push(makeBubble("agent", agentText, item.completed_at || item.updated_at || "", toolCallsForNode(item), active));
   }
   els.conversationList.replaceChildren(...bubbles);
-  els.conversationList.scrollTop = els.conversationList.scrollHeight;
 }
 
 function renderComposer() {
@@ -1553,6 +1575,7 @@ async function saveNote() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "保存失败");
     state.noteDirty = false;
+    state.noteEditing = false;
     state.noteDraftNodeId = data.node.id;
     state.noteDraft = data.node.note_md || "";
     await fetchTree();
@@ -1575,16 +1598,109 @@ async function readProjectNotes() {
   }
   state.projectNotes = data.notes || [];
   state.projectNotesProjectId = projectId;
+  state.noteEditing = false;
   state.activeSideTab = "notes";
   renderSideTabs();
   renderNotePanel();
 }
 
-function selectedConversationText() {
+function cleanMarkdown(value) {
+  return String(value || "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function markdownChildren(node) {
+  return Array.from(node.childNodes || []).map((child) => markdownFromNode(child)).join("");
+}
+
+function markdownFromNode(node) {
+  if (node.nodeType === Node.TEXT_NODE) return node.textContent || "";
+  if (node.nodeType === Node.DOCUMENT_FRAGMENT_NODE) return markdownChildren(node);
+  if (node.nodeType !== Node.ELEMENT_NODE) return "";
+
+  const el = node;
+  const tag = el.tagName.toLowerCase();
+  if (el.classList.contains("bubble-label") || el.classList.contains("bubble-meta")) return "";
+  if (tag === "br") return "\n";
+  if (tag === "hr") return "\n---\n";
+  if (tag === "strong" || tag === "b") return `**${markdownChildren(el).trim()}**`;
+  if (tag === "em" || tag === "i") return `*${markdownChildren(el).trim()}*`;
+  if (tag === "code" && el.parentElement && el.parentElement.tagName.toLowerCase() !== "pre") {
+    return `\`${el.textContent || ""}\``;
+  }
+  if (tag === "a") {
+    const label = markdownChildren(el).trim() || el.textContent || "";
+    const href = el.getAttribute("href") || "";
+    return href ? `[${label}](${href})` : label;
+  }
+  if (tag === "pre") {
+    const code = el.querySelector("code");
+    const language = code && code.dataset.language ? code.dataset.language : "";
+    const text = code ? code.textContent || "" : el.textContent || "";
+    return code ? `\n\`\`\`${language}\n${text.replace(/\n$/, "")}\n\`\`\`\n` : `\n${text}\n`;
+  }
+  if (/^h[1-6]$/.test(tag)) {
+    const level = Number(tag.slice(1));
+    return `\n${"#".repeat(level)} ${markdownChildren(el).trim()}\n`;
+  }
+  if (tag === "p") return `\n${markdownChildren(el).trim()}\n`;
+  if (tag === "blockquote") {
+    const body = cleanMarkdown(markdownChildren(el));
+    return `\n${body.split("\n").map((line) => `> ${line}`).join("\n")}\n`;
+  }
+  if (tag === "ul" || tag === "ol") {
+    const items = Array.from(el.children).filter((child) => child.tagName.toLowerCase() === "li");
+    return `\n${items.map((item, index) => {
+      const marker = tag === "ol" ? `${index + 1}.` : "-";
+      const body = cleanMarkdown(markdownChildren(item)).replace(/\n/g, "\n  ");
+      return `${marker} ${body}`;
+    }).join("\n")}\n`;
+  }
+  if (tag === "li") return markdownChildren(el);
+  return markdownChildren(el);
+}
+
+function applyAncestorMarkdown(markdown, range) {
+  let result = cleanMarkdown(markdown);
+  if (!result) return "";
+  let el = range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
+    ? range.commonAncestorContainer
+    : range.commonAncestorContainer.parentElement;
+  while (el && el !== els.conversationList) {
+    const tag = el.tagName.toLowerCase();
+    if ((tag === "strong" || tag === "b") && !/^\*\*[\s\S]+\*\*$/.test(result)) {
+      result = `**${result}**`;
+    } else if ((tag === "em" || tag === "i") && !/^\*[\s\S]+\*$/.test(result)) {
+      result = `*${result}*`;
+    } else if (tag === "code" && el.parentElement && el.parentElement.tagName.toLowerCase() === "pre") {
+      const language = el.dataset.language || "";
+      result = `\`\`\`${language}\n${result}\n\`\`\``;
+    } else if (tag === "code" && !/^`[\s\S]+`$/.test(result)) {
+      result = `\`${result}\``;
+    } else if (tag === "a" && !/^\[[\s\S]+\]\([^)]+\)$/.test(result)) {
+      const href = el.getAttribute("href") || "";
+      if (href) result = `[${result}](${href})`;
+    } else if (/^h[1-6]$/.test(tag) && !/^#{1,6}\s/.test(result)) {
+      result = `${"#".repeat(Number(tag.slice(1)))} ${result}`;
+    } else if (tag === "li" && !/^(-|\d+\.)\s/.test(result)) {
+      const parent = el.parentElement;
+      const ordered = parent && parent.tagName.toLowerCase() === "ol";
+      const siblings = parent ? Array.from(parent.children).filter((child) => child.tagName.toLowerCase() === "li") : [];
+      const marker = ordered ? `${Math.max(1, siblings.indexOf(el) + 1)}.` : "-";
+      result = `${marker} ${result.replace(/\n/g, "\n  ")}`;
+    } else if (tag === "blockquote" && !/^>\s/m.test(result)) {
+      result = result.split("\n").map((line) => `> ${line}`).join("\n");
+    }
+    el = el.parentElement;
+  }
+  return cleanMarkdown(result);
+}
+
+function selectedConversationMarkdown() {
   const selection = window.getSelection();
   if (!selection || selection.isCollapsed) return "";
-  const text = selection.toString().trim();
-  if (!text) return "";
   const anchor = selection.anchorNode && (selection.anchorNode.nodeType === Node.ELEMENT_NODE
     ? selection.anchorNode
     : selection.anchorNode.parentElement);
@@ -1593,7 +1709,17 @@ function selectedConversationText() {
     : selection.focusNode.parentElement);
   if (!anchor || !focus) return "";
   if (!els.conversationList.contains(anchor) || !els.conversationList.contains(focus)) return "";
-  return text;
+  const parts = [];
+  for (let i = 0; i < selection.rangeCount; i += 1) {
+    const range = selection.getRangeAt(i);
+    const ancestor = range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
+      ? range.commonAncestorContainer
+      : range.commonAncestorContainer.parentElement;
+    if (!ancestor || !els.conversationList.contains(ancestor)) continue;
+    const markdown = applyAncestorMarkdown(markdownFromNode(range.cloneContents()), range);
+    if (markdown) parts.push(markdown);
+  }
+  return cleanMarkdown(parts.join("\n\n")) || selection.toString().trim();
 }
 
 function showNoteContextMenu(event, text) {
@@ -1766,12 +1892,19 @@ function wireEvents() {
     state.noteDraftNodeId = node ? node.id : null;
     state.noteDraft = els.noteEditor.value;
     state.noteDirty = Boolean(node);
+    renderTree();
     renderNotePanel();
+  });
+  els.noteEditBtn.addEventListener("click", () => {
+    if (!selectedNode()) return;
+    state.noteEditing = true;
+    renderNotePanel();
+    els.noteEditor.focus();
   });
   els.noteSaveBtn.addEventListener("click", saveNote);
   els.noteProjectBtn.addEventListener("click", readProjectNotes);
   els.conversationList.addEventListener("contextmenu", (event) => {
-    const text = selectedConversationText();
+    const text = selectedConversationMarkdown();
     if (!text || !selectedNode()) return;
     event.preventDefault();
     showNoteContextMenu(event, text);
