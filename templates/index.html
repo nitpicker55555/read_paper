@@ -89,22 +89,15 @@
 
           <div id="conversationList" class="conversation-list"></div>
 
-          <section class="attachment-dock">
-            <div class="panel-heading">
-              <h2>附件</h2>
-              <label class="upload-button">
-                <input id="fileInput" type="file" multiple />
-                <span>上传</span>
-              </label>
-            </div>
-            <div id="fileList" class="file-list"></div>
-          </section>
-
           <form id="composer" class="composer sidebar-composer">
             <div class="composer-meta">
               <div id="selectedFiles" class="selected-files"></div>
             </div>
             <div class="composer-row">
+              <label class="composer-upload" title="上传附件" aria-label="上传附件">
+                <input id="fileInput" type="file" multiple />
+                <span aria-hidden="true">+</span>
+              </label>
               <textarea id="promptInput" rows="3" placeholder="输入问题"></textarea>
               <button id="sendBtn" type="submit">发送</button>
             </div>

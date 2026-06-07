@@ -67,7 +67,6 @@ const els = {
   deleteBtn: document.getElementById("deleteBtn"),
   exportBtn: document.getElementById("exportBtn"),
   fileInput: document.getElementById("fileInput"),
-  fileList: document.getElementById("fileList"),
   workspaceDrawer: document.getElementById("workspaceDrawer"),
   workspaceToggleBtn: document.getElementById("workspaceToggleBtn"),
   workspaceCollapseBtn: document.getElementById("workspaceCollapseBtn"),
@@ -489,7 +488,6 @@ function render() {
   renderMiniMap();
   renderConversation();
   renderComposer();
-  renderFiles();
   renderWorkspaceFiles();
   renderWorkspaceDrawer();
   renderProjectSelect();
@@ -836,32 +834,6 @@ function selectedConversationPath() {
   return path.reverse();
 }
 
-function fileById(fileId) {
-  return state.files.find((item) => item.id === fileId) || null;
-}
-
-function contextAttachmentFiles() {
-  const attachments = [];
-  const seen = new Set();
-  for (const node of selectedConversationPath()) {
-    for (const attachment of node.attachments || []) {
-      const fileId = String(attachment.id || "").trim();
-      if (!fileId || seen.has(fileId)) continue;
-      seen.add(fileId);
-      const file = fileById(fileId);
-      const size = Number(attachment.size ?? (file && file.size));
-      attachments.push({
-        id: fileId,
-        original_name: attachment.name || (file && file.original_name) || "未命名附件",
-        mime: attachment.mime || (file && file.mime) || "",
-        size: Number.isFinite(size) ? size : 0,
-        source_title: node.title || "节点",
-      });
-    }
-  }
-  return attachments;
-}
-
 function describeTool(item) {
   const type = item.type || "tool";
   if (type === "command_execution") {
@@ -1053,7 +1025,6 @@ function renderComposer() {
       () => {
         state.fileIds.delete(fileId);
         renderComposer();
-        renderFiles();
       }
     );
     els.selectedFiles.appendChild(chip);
@@ -1066,31 +1037,6 @@ function renderComposer() {
     els.selectedFiles.appendChild(chip);
   }
   els.sendBtn.disabled = state.sending;
-}
-
-function renderFiles() {
-  const files = contextAttachmentFiles();
-  if (!files.length) {
-    const empty = document.createElement("div");
-    empty.className = "soft-label";
-    empty.textContent = "暂无附件";
-    els.fileList.replaceChildren(empty);
-    return;
-  }
-  const rows = files.map((file) => {
-    const row = document.createElement("div");
-    row.className = "file-row";
-    row.title = file.original_name;
-    const icon = document.createElement("span");
-    icon.className = "file-icon";
-    icon.textContent = compactFileIcon(file);
-    const name = document.createElement("span");
-    name.className = "file-name";
-    name.textContent = compactFileName(file.original_name);
-    row.append(icon, name);
-    return row;
-  });
-  els.fileList.replaceChildren(...rows);
 }
 
 function workspaceIcon(file) {
