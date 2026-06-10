@@ -6,3 +6,5 @@ __pycache__/
 instance/
 *.pyc
 .env
+.env.local
+.env.*.local
