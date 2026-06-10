@@ -914,11 +914,35 @@ async def _run_codex_for_node_async(node_id: str) -> None:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(BASE_DIR),
                 env=client.env,
+                # Codex --json can emit single events well over the 64KB default
+                # (e.g. an item with a huge aggregated_output). Raise the per-line
+                # limit so the StreamReader doesn't raise "Separator is found, but
+                # chunk is longer than limit".
+                limit=64 * 1024 * 1024,
             )
 
             async def pump_stdout() -> None:
                 assert proc.stdout is not None
-                async for raw in proc.stdout:
+                while True:
+                    try:
+                        raw = await proc.stdout.readline()
+                    except ValueError:
+                        # A line exceeded `limit` despite our generous cap, or contained
+                        # an unexpected sequence. Drain the offending segment(s) and skip.
+                        skipped = []
+                        while True:
+                            try:
+                                chunk = await proc.stdout.read(1024 * 1024)
+                            except ValueError:
+                                continue
+                            if not chunk:
+                                break
+                            skipped.append(chunk)
+                            if b"\n" in chunk:
+                                break
+                        continue
+                    if not raw:
+                        break
                     line = raw.decode("utf-8", errors="replace")
                     stdout_lines.append(line)
                     event = parse_jsonl_line(line)
