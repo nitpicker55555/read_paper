@@ -1746,21 +1746,99 @@ async function fetchWorkspaceFiles() {
 }
 
 function handlePromptDragOver(event) {
-  if (!Array.from(event.dataTransfer.types || []).includes("text/plain")) return;
+  const types = Array.from(event.dataTransfer.types || []);
+  if (!types.includes("text/plain") && !types.includes("Files")) return;
   event.preventDefault();
   event.dataTransfer.dropEffect = "copy";
   els.promptInput.classList.add("drop-target");
 }
 
 function handlePromptDrop(event) {
+  els.promptInput.classList.remove("drop-target");
+  // Handle external file drops from OS
+  if (event.dataTransfer.files && event.dataTransfer.files.length > 0) {
+    event.preventDefault();
+    uploadDroppedFiles(event.dataTransfer.files);
+    return;
+  }
+  // Handle workspace ref drops
   const rawRef = event.dataTransfer.getData("application/x-workspace-ref");
   if (!rawRef) return;
   event.preventDefault();
-  els.promptInput.classList.remove("drop-target");
   try {
     const ref = JSON.parse(rawRef);
     if (!ref.path || state.workspaceRefs.some((item) => item.path === ref.path)) return;
     state.workspaceRefs.push(ref);
+    renderComposer();
+  } catch (err) {
+    window.alert(err.message);
+  }
+}
+
+/* ── Conversation pane drop zone for external files ── */
+let _dropOverlayCounter = 0;
+
+function showDropOverlay() {
+  let overlay = els.conversationPane.querySelector(".drop-overlay");
+  if (!overlay) {
+    overlay = document.createElement("div");
+    overlay.className = "drop-overlay";
+    overlay.innerHTML = '<div class="drop-overlay-label">释放以上传文件</div>';
+    els.conversationPane.appendChild(overlay);
+  }
+  overlay.hidden = false;
+}
+
+function hideDropOverlay() {
+  const overlay = els.conversationPane.querySelector(".drop-overlay");
+  if (overlay) overlay.hidden = true;
+}
+
+function handlePaneDragEnter(event) {
+  const types = Array.from(event.dataTransfer.types || []);
+  if (!types.includes("Files")) return;
+  event.preventDefault();
+  _dropOverlayCounter++;
+  if (_dropOverlayCounter === 1) showDropOverlay();
+}
+
+function handlePaneDragOver(event) {
+  const types = Array.from(event.dataTransfer.types || []);
+  if (!types.includes("Files")) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = "copy";
+}
+
+function handlePaneDragLeave(event) {
+  _dropOverlayCounter--;
+  if (_dropOverlayCounter <= 0) {
+    _dropOverlayCounter = 0;
+    hideDropOverlay();
+  }
+}
+
+function handlePaneDrop(event) {
+  _dropOverlayCounter = 0;
+  hideDropOverlay();
+  if (!event.dataTransfer.files || event.dataTransfer.files.length === 0) return;
+  event.preventDefault();
+  uploadDroppedFiles(event.dataTransfer.files);
+}
+
+async function uploadDroppedFiles(fileList) {
+  const files = [...fileList];
+  if (!files.length) return;
+  const form = new FormData();
+  for (const file of files) form.append("files", file);
+  try {
+    const res = await fetch("/api/upload", { method: "POST", body: form });
+    const data = await res.json();
+    if (!res.ok) {
+      window.alert(data.error || "上传失败");
+      return;
+    }
+    for (const file of data.files || []) state.fileIds.add(file.id);
+    await fetchTree();
     renderComposer();
   } catch (err) {
     window.alert(err.message);
@@ -2239,6 +2317,10 @@ function wireEvents() {
   els.promptInput.addEventListener("dragover", handlePromptDragOver);
   els.promptInput.addEventListener("dragleave", () => els.promptInput.classList.remove("drop-target"));
   els.promptInput.addEventListener("drop", handlePromptDrop);
+  els.conversationPane.addEventListener("dragenter", handlePaneDragEnter);
+  els.conversationPane.addEventListener("dragover", handlePaneDragOver);
+  els.conversationPane.addEventListener("dragleave", handlePaneDragLeave);
+  els.conversationPane.addEventListener("drop", handlePaneDrop);
   els.promptInput.addEventListener("keydown", (event) => {
     if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
     event.preventDefault();
