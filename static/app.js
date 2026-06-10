@@ -6,7 +6,7 @@ const Y_GAP = 150;
 const PALETTE = ["#287c74", "#b6542f", "#3a6ea5", "#6f7d51", "#9b4d68", "#7a6840", "#2f7d51", "#8c5b2e"];
 const SIDE_WIDTH_KEY = "sidePanelWidth";
 const DEFAULT_SIDE_WIDTH = 420;
-const MIN_SIDE_WIDTH = 340;
+const MIN_SIDE_WIDTH = 240;
 const MAX_SIDE_WIDTH = 920;
 
 const state = {
@@ -48,6 +48,10 @@ const state = {
   projectNotesProjectId: null,
   noteContextText: "",
   scrollConversationToLatest: false,
+  mode: "live",
+  liveSnapshot: null,
+  ccSnapshot: null,
+  ccPath: "",
 };
 
 const els = {
@@ -105,6 +109,9 @@ const els = {
   workspacePreviewBody: document.getElementById("workspacePreviewBody"),
   workspaceOpenBtn: document.getElementById("workspaceOpenBtn"),
   workspaceDownloadBtn: document.getElementById("workspaceDownloadBtn"),
+  modeLiveBtn: document.getElementById("modeLiveBtn"),
+  modeHistoryBtn: document.getElementById("modeHistoryBtn"),
+  ccImportBtn: document.getElementById("ccImportBtn"),
 };
 
 function svgEl(name) {
@@ -133,13 +140,6 @@ function compact(text, limit = 140) {
   const normalized = String(text || "").replace(/\s+/g, " ").trim();
   if (normalized.length <= limit) return normalized;
   return `${normalized.slice(0, limit - 1)}…`;
-}
-
-function firstLines(text, limit = 10) {
-  const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
-  const visible = lines.slice(0, limit);
-  if (lines.length > limit) visible.push("...");
-  return visible.join("\n").trim();
 }
 
 function compactFileName(name, head = 10, tail = 12) {
@@ -494,6 +494,10 @@ function parentNode() {
 }
 
 async function fetchTree({ keepSelection = true } = {}) {
+  if (state.mode === "claude_code") {
+    if (state.ccPath) await fetchClaudeCodeTree(state.ccPath, { keepSelection });
+    return;
+  }
   const res = await fetch("/api/tree");
   const data = await res.json();
   state.allNodes = data.nodes || [];
@@ -517,6 +521,119 @@ async function fetchTree({ keepSelection = true } = {}) {
   render();
 }
 
+async function fetchClaudeCodeTree(path, { keepSelection = false } = {}) {
+  const cleanPath = String(path || "").trim();
+  if (!cleanPath) return false;
+  const previousProject = keepSelection ? state.selectedProjectId : null;
+  const previousNode = keepSelection ? state.selectedId : null;
+  try {
+    const res = await fetch(`/api/claude-code/tree?path=${encodeURIComponent(cleanPath)}`);
+    const data = await res.json();
+    if (!res.ok) {
+      window.alert(data.error || `读取失败 (HTTP ${res.status})`);
+      return false;
+    }
+    state.allNodes = data.nodes || [];
+    state.files = [];
+    state.workDir = data.claude_dir || "";
+    state.ccPath = cleanPath;
+    localStorage.setItem("ccLastPath", cleanPath);
+    rebuildProjects();
+    if (keepSelection && previousProject && state.projects.some((p) => p.id === previousProject)) {
+      state.selectedProjectId = previousProject;
+    } else {
+      state.selectedProjectId = state.projects.length ? state.projects[0].id : null;
+    }
+    state.nodes = nodesForProject(state.selectedProjectId);
+    rebuildIndexes();
+    if (keepSelection && previousNode && state.nodeById.has(previousNode)) {
+      state.selectedId = previousNode;
+    } else {
+      state.selectedId = state.selectedProjectId;
+    }
+    state.parentId = state.selectedId;
+    render();
+    return true;
+  } catch (err) {
+    window.alert(`读取失败：${err.message || err}`);
+    return false;
+  }
+}
+
+function snapshotMode() {
+  return {
+    allNodes: state.allNodes,
+    files: state.files,
+    workDir: state.workDir,
+    selectedProjectId: state.selectedProjectId,
+    selectedId: state.selectedId,
+    parentId: state.parentId,
+    ccPath: state.ccPath,
+  };
+}
+
+function restoreMode(snap) {
+  if (!snap) {
+    state.allNodes = [];
+    state.files = [];
+    state.workDir = "";
+    state.selectedProjectId = state.mode === "live" ? "__new__" : null;
+    state.selectedId = null;
+    state.parentId = null;
+    state.ccPath = "";
+    return;
+  }
+  state.allNodes = snap.allNodes || [];
+  state.files = snap.files || [];
+  state.workDir = snap.workDir || "";
+  state.selectedProjectId = snap.selectedProjectId ?? (state.mode === "live" ? "__new__" : null);
+  state.selectedId = snap.selectedId || null;
+  state.parentId = snap.parentId || null;
+  state.ccPath = snap.ccPath || "";
+}
+
+async function setMode(newMode) {
+  if (newMode !== "live" && newMode !== "claude_code") return;
+  if (newMode === state.mode) return;
+  // Save current snapshot
+  if (state.mode === "live") state.liveSnapshot = snapshotMode();
+  else state.ccSnapshot = snapshotMode();
+
+  state.mode = newMode;
+  document.body.classList.toggle("mode-claude_code", newMode === "claude_code");
+  document.body.classList.toggle("mode-live", newMode === "live");
+  if (els.modeLiveBtn) els.modeLiveBtn.classList.toggle("active", newMode === "live");
+  if (els.modeHistoryBtn) els.modeHistoryBtn.classList.toggle("active", newMode === "claude_code");
+  if (els.ccImportBtn) els.ccImportBtn.hidden = newMode !== "claude_code";
+
+  if (newMode === "live") {
+    restoreMode(state.liveSnapshot);
+    await fetchTree();
+  } else {
+    if (state.ccSnapshot && state.ccSnapshot.allNodes.length) {
+      restoreMode(state.ccSnapshot);
+      rebuildProjects();
+      state.nodes = nodesForProject(state.selectedProjectId);
+      rebuildIndexes();
+      render();
+    } else {
+      restoreMode(null);
+      rebuildProjects();
+      render();
+      promptImportClaudeCodePath();
+    }
+  }
+}
+
+async function promptImportClaudeCodePath() {
+  const last = localStorage.getItem("ccLastPath") || "";
+  const path = window.prompt("输入本地项目路径\n（直接读 ~/.claude/projects/<slug>/，每个根对话 = 一个项目）", last);
+  if (path === null) return;
+  const trimmed = path.trim();
+  if (!trimmed) return;
+  await fetchClaudeCodeTree(trimmed);
+}
+
 function rebuildProjects() {
   const allById = new Map(state.allNodes.map((node) => [node.id, node]));
   state.projects = state.allNodes
@@ -526,10 +643,14 @@ function rebuildProjects() {
 
 function ensureSelectedProject(keepSelection) {
   const valid = state.projects.some((project) => project.id === state.selectedProjectId);
-  if (state.selectedProjectId === "__new__") return;
+  if (state.mode === "live" && state.selectedProjectId === "__new__") return;
   if (!keepSelection || !valid) {
-    state.selectedProjectId = state.projects.length ? state.projects[0].id : "__new__";
-    localStorage.setItem("selectedProjectId", state.selectedProjectId);
+    if (state.mode === "live") {
+      state.selectedProjectId = "__new__";
+      localStorage.setItem("selectedProjectId", state.selectedProjectId);
+    } else {
+      state.selectedProjectId = state.projects.length ? state.projects[0].id : null;
+    }
   }
 }
 
@@ -607,12 +728,20 @@ function setWorkspaceDrawerOpen(open) {
 }
 
 function renderProjectSelect() {
-  const currentValue = state.selectedProjectId || "__new__";
+  const isLive = state.mode === "live";
+  const currentValue = state.selectedProjectId || (isLive ? "__new__" : "");
   const options = [];
-  const newOption = document.createElement("option");
-  newOption.value = "__new__";
-  newOption.textContent = "new session";
-  options.push(newOption);
+  if (isLive) {
+    const newOption = document.createElement("option");
+    newOption.value = "__new__";
+    newOption.textContent = "new session";
+    options.push(newOption);
+  } else if (!state.projects.length) {
+    const empty = document.createElement("option");
+    empty.value = "";
+    empty.textContent = state.ccPath ? "（无对话）" : "点击 📥 选择项目";
+    options.push(empty);
+  }
   for (const project of state.projects) {
     const option = document.createElement("option");
     option.value = project.id;
@@ -621,7 +750,7 @@ function renderProjectSelect() {
   }
   els.projectSelect.replaceChildren(...options);
   els.projectSelect.value = currentValue;
-  els.projectSelect.classList.toggle("placeholder", currentValue === "__new__");
+  els.projectSelect.classList.toggle("placeholder", isLive && currentValue === "__new__");
 }
 
 function layoutTree() {
@@ -777,15 +906,36 @@ function positionNodeNotePreview(target) {
   preview.style.top = `${clamp(top, margin, window.innerHeight - height - margin)}px`;
 }
 
+let nodeNotePreviewHideTimer = null;
+
+function cancelNodeNotePreviewHide() {
+  if (nodeNotePreviewHideTimer) {
+    clearTimeout(nodeNotePreviewHideTimer);
+    nodeNotePreviewHideTimer = null;
+  }
+}
+
 function showNodeNotePreview(node, target) {
   const note = String(noteTextForNode(node) || "").trim();
   if (!note) return;
+  cancelNodeNotePreviewHide();
   els.nodeNotePreview.replaceChildren(renderMarkdown(note));
   els.nodeNotePreview.hidden = false;
   positionNodeNotePreview(target);
 }
 
+// Short grace delay just bridges the ~8px visual gap between the node card and the
+// preview so the cursor can transit onto the preview to scroll. Effectively instant.
 function hideNodeNotePreview() {
+  cancelNodeNotePreviewHide();
+  nodeNotePreviewHideTimer = setTimeout(() => {
+    els.nodeNotePreview.hidden = true;
+    nodeNotePreviewHideTimer = null;
+  }, 180);
+}
+
+function hideNodeNotePreviewImmediate() {
+  cancelNodeNotePreviewHide();
   els.nodeNotePreview.hidden = true;
 }
 
@@ -843,8 +993,11 @@ function makeNodeCard(node) {
     .join(" ");
   card.style.setProperty("--node-color", colorFor(node));
   card.dataset.nodeId = node.id;
+  const noteText = String(noteTextForNode(node)).trim();
+
   card.addEventListener("mouseenter", (event) => {
     if (event.target.closest && event.target.closest(".node-note-button")) return;
+    hideNodeNotePreviewImmediate();
     showNodePromptPreview(node, card);
   });
   card.addEventListener("mousemove", (event) => {
@@ -854,9 +1007,11 @@ function makeNodeCard(node) {
     }
     positionNodePromptPreview(card);
   });
-  card.addEventListener("mouseleave", hideNodePromptPreview);
+  card.addEventListener("mouseleave", () => {
+    hideNodePromptPreview();
+    if (noteText) hideNodeNotePreview();
+  });
 
-  const noteText = String(noteTextForNode(node)).trim();
   if (noteText) {
     const noteButton = document.createElement("button");
     noteButton.type = "button";
@@ -869,12 +1024,9 @@ function makeNodeCard(node) {
       showNodeNotePreview(node, event.currentTarget);
     });
     noteButton.addEventListener("mousemove", (event) => positionNodeNotePreview(event.currentTarget));
-    noteButton.addEventListener("mouseleave", () => {
-      hideNodeNotePreview();
-    });
     noteButton.addEventListener("click", (event) => {
       event.stopPropagation();
-      hideNodeNotePreview();
+      hideNodeNotePreviewImmediate();
       openNodeNote(node.id);
     });
     card.appendChild(noteButton);
@@ -929,7 +1081,7 @@ function makeNodeCard(node) {
 
 function selectNode(id) {
   hideNodePromptPreview();
-  hideNodeNotePreview();
+  hideNodeNotePreviewImmediate();
   state.selectedId = id;
   state.parentId = id;
   render();
@@ -947,13 +1099,16 @@ function applyTransform() {
   els.viewport.setAttribute("transform", `translate(${state.transform.x} ${state.transform.y}) scale(${state.transform.k})`);
 }
 
+const MIN_K = 0.05;
+const MAX_K = 2.4;
+
 function zoomAt(factor, clientX, clientY) {
   const rect = els.treeSvg.getBoundingClientRect();
   const px = clientX - rect.left;
   const py = clientY - rect.top;
   const beforeX = (px - state.transform.x) / state.transform.k;
   const beforeY = (py - state.transform.y) / state.transform.k;
-  const nextK = clamp(state.transform.k * factor, 0.28, 2.4);
+  const nextK = clamp(state.transform.k * factor, MIN_K, MAX_K);
   state.transform.x = px - beforeX * nextK;
   state.transform.y = py - beforeY * nextK;
   state.transform.k = nextK;
@@ -961,14 +1116,24 @@ function zoomAt(factor, clientX, clientY) {
   renderMiniMap();
 }
 
-function focusSelected() {
+function fitTreeToView({ margin = 60, allowZoomIn = false } = {}) {
   if (!state.layout.size) return;
-  const target = state.selectedId && state.layout.get(state.selectedId) ? state.layout.get(state.selectedId) : boundsCenter();
   const rect = els.canvasHost.getBoundingClientRect();
-  state.transform.x = rect.width / 2 - (target.x + NODE_W / 2) * state.transform.k;
-  state.transform.y = rect.height / 2 - (target.y + NODE_H / 2) * state.transform.k;
+  const bounds = treeBounds();
+  const fitK = Math.min(
+    (rect.width - margin * 2) / Math.max(bounds.w, 1),
+    (rect.height - margin * 2) / Math.max(bounds.h, 1),
+  );
+  const targetK = allowZoomIn ? fitK : Math.min(fitK, 1);
+  state.transform.k = clamp(targetK, MIN_K, MAX_K);
+  state.transform.x = rect.width / 2 - (bounds.x + bounds.w / 2) * state.transform.k;
+  state.transform.y = rect.height / 2 - (bounds.y + bounds.h / 2) * state.transform.k;
   applyTransform();
   renderMiniMap();
+}
+
+function focusSelected() {
+  fitTreeToView();
 }
 
 function boundsCenter() {
@@ -994,12 +1159,32 @@ function treeBounds() {
   return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
 }
 
+function miniMapGeometry() {
+  const canvas = els.miniMap;
+  const cssW = canvas.clientWidth || 180;
+  const cssH = canvas.clientHeight || 116;
+  if (!state.layout.size) return { cssW, cssH, scale: 0, tx: 0, ty: 0 };
+  const bounds = treeBounds();
+  const pad = 12;
+  const scale = Math.min(
+    (cssW - pad * 2) / Math.max(bounds.w, 1),
+    (cssH - pad * 2) / Math.max(bounds.h, 1),
+  );
+  return {
+    cssW,
+    cssH,
+    scale,
+    tx: pad - bounds.x * scale,
+    ty: pad - bounds.y * scale,
+  };
+}
+
 function renderMiniMap() {
   const canvas = els.miniMap;
   const ctx = canvas.getContext("2d");
   const dpr = window.devicePixelRatio || 1;
-  const cssW = canvas.clientWidth || 180;
-  const cssH = canvas.clientHeight || 116;
+  const geo = miniMapGeometry();
+  const { cssW, cssH, scale, tx, ty } = geo;
   if (canvas.width !== cssW * dpr || canvas.height !== cssH * dpr) {
     canvas.width = cssW * dpr;
     canvas.height = cssH * dpr;
@@ -1009,11 +1194,6 @@ function renderMiniMap() {
   ctx.fillStyle = "rgba(255, 253, 250, 0.92)";
   ctx.fillRect(0, 0, cssW, cssH);
   if (!state.layout.size) return;
-  const bounds = treeBounds();
-  const pad = 12;
-  const scale = Math.min((cssW - pad * 2) / Math.max(bounds.w, 1), (cssH - pad * 2) / Math.max(bounds.h, 1));
-  const tx = pad - bounds.x * scale;
-  const ty = pad - bounds.y * scale;
 
   ctx.lineWidth = 1;
   for (const node of state.nodes) {
@@ -1595,6 +1775,7 @@ function renderDirectionControls() {
 
 async function sendPrompt(event) {
   event.preventDefault();
+  if (state.mode === "claude_code") return;
   const prompt = els.promptInput.value.trim();
   if (!prompt || state.sending) return;
   state.sending = true;
@@ -1896,6 +2077,7 @@ async function patchSelected(payload) {
 }
 
 async function deleteSelected() {
+  if (state.mode === "claude_code") return;
   const node = selectedNode();
   if (!node) return;
   const children = state.childrenByParent.get(node.id) || [];
@@ -2046,7 +2228,7 @@ function wireEvents() {
     if (event.key === "Escape" && !els.workspacePreview.hidden) closeWorkspacePreview();
     if (event.key === "Escape") {
       hideNoteContextMenu();
-      hideNodeNotePreview();
+      hideNodeNotePreviewImmediate();
       hideNodePromptPreview();
     }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s" && state.activeSideTab === "notes") {
@@ -2081,27 +2263,74 @@ function wireEvents() {
   }
   els.projectSelect.addEventListener("change", () => {
     const value = els.projectSelect.value;
-    if (value === "__new__") {
+    if (state.mode === "live" && value === "__new__") {
       startNewProject();
       return;
     }
+    if (!value) return;
     state.selectedProjectId = value;
     state.nodes = nodesForProject(value);
     state.selectedId = value;
     state.parentId = value;
-    localStorage.setItem("selectedProjectId", value);
+    if (state.mode === "live") localStorage.setItem("selectedProjectId", value);
     rebuildIndexes();
     render();
     focusSelected();
-    fetchWorkspaceFiles().catch(console.error);
+    if (state.mode === "live") fetchWorkspaceFiles().catch(console.error);
   });
   els.emptyState.addEventListener("click", () => {
     els.promptInput.focus();
   });
   els.refreshBtn.addEventListener("click", () => {
+    if (state.mode === "claude_code") {
+      if (state.ccPath) fetchClaudeCodeTree(state.ccPath, { keepSelection: true }).catch(console.error);
+      else promptImportClaudeCodePath();
+      return;
+    }
     fetchTree().catch(console.error);
     fetchWorkspaceFiles().catch(console.error);
   });
+
+  if (els.modeLiveBtn) els.modeLiveBtn.addEventListener("click", () => setMode("live").catch(console.error));
+  if (els.modeHistoryBtn) els.modeHistoryBtn.addEventListener("click", () => setMode("claude_code").catch(console.error));
+  if (els.ccImportBtn) els.ccImportBtn.addEventListener("click", promptImportClaudeCodePath);
+
+  if (els.miniMap) {
+    let dragging = false;
+    const moveViewportTo = (clientX, clientY) => {
+      const geo = miniMapGeometry();
+      if (!geo.scale) return;
+      const rect = els.miniMap.getBoundingClientRect();
+      const mx = clientX - rect.left;
+      const my = clientY - rect.top;
+      const treeX = (mx - geo.tx) / geo.scale;
+      const treeY = (my - geo.ty) / geo.scale;
+      const host = els.canvasHost.getBoundingClientRect();
+      state.transform.x = host.width / 2 - treeX * state.transform.k;
+      state.transform.y = host.height / 2 - treeY * state.transform.k;
+      applyTransform();
+      renderMiniMap();
+    };
+    els.miniMap.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      dragging = true;
+      els.miniMap.setPointerCapture(event.pointerId);
+      els.miniMap.classList.add("dragging");
+      moveViewportTo(event.clientX, event.clientY);
+    });
+    els.miniMap.addEventListener("pointermove", (event) => {
+      if (!dragging) return;
+      moveViewportTo(event.clientX, event.clientY);
+    });
+    const endDrag = (event) => {
+      if (!dragging) return;
+      dragging = false;
+      els.miniMap.classList.remove("dragging");
+      try { els.miniMap.releasePointerCapture(event.pointerId); } catch {}
+    };
+    els.miniMap.addEventListener("pointerup", endDrag);
+    els.miniMap.addEventListener("pointercancel", endDrag);
+  }
   els.focusBtn.addEventListener("click", focusSelected);
   els.zoomInBtn.addEventListener("click", () => {
     const rect = els.canvasHost.getBoundingClientRect();
@@ -2116,8 +2345,17 @@ function wireEvents() {
 
   els.treeSvg.addEventListener("wheel", (event) => {
     event.preventDefault();
-    zoomAt(event.deltaY < 0 ? 1.08 : 0.92, event.clientX, event.clientY);
+    // Trackpads fire many wheel events per gesture with small deltaY each;
+    // map magnitude → factor so the gesture feels continuous instead of stepping.
+    const dy = Math.max(-80, Math.min(80, event.deltaY));
+    const factor = Math.exp(-dy * 0.0035);
+    zoomAt(factor, event.clientX, event.clientY);
   }, { passive: false });
+
+  if (els.nodeNotePreview) {
+    els.nodeNotePreview.addEventListener("mouseenter", cancelNodeNotePreviewHide);
+    els.nodeNotePreview.addEventListener("mouseleave", hideNodeNotePreviewImmediate);
+  }
   els.treeSvg.addEventListener("pointerdown", (event) => {
     if (event.target.closest && event.target.closest(".node-card")) return;
     state.dragging = true;
@@ -2152,6 +2390,7 @@ function wireEvents() {
 }
 
 initSidePanelWidth();
+document.body.classList.add("mode-live");
 wireEvents();
 fetchTree({ keepSelection: false })
   .then(() => {

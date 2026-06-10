@@ -65,8 +65,8 @@ pre {
 }
 
 .topbar {
-  display: grid;
-  grid-template-columns: minmax(210px, 300px) minmax(170px, 260px) minmax(220px, 1fr) auto;
+  display: flex;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 14px;
   padding: 0 16px;
@@ -74,6 +74,13 @@ pre {
   background: rgba(251, 250, 247, 0.94);
   backdrop-filter: blur(12px);
 }
+
+.topbar .brand { flex: 1 1 180px; min-width: 0; max-width: 300px; }
+.topbar .mode-toggle { flex: 0 0 auto; }
+.topbar .project-select { flex: 1 1 160px; min-width: 0; max-width: 260px; }
+.topbar #ccImportBtn { flex: 0 0 auto; }
+.topbar .search-box { flex: 1 1 160px; min-width: 0; }
+.topbar .topbar-actions { flex: 0 0 auto; margin-left: auto; }
 
 .brand {
   display: flex;
@@ -201,6 +208,65 @@ pre {
 .direction-toggle button.active {
   background: #202124;
   color: #fffdfa;
+}
+
+.mode-toggle {
+  display: inline-grid;
+  grid-template-columns: 1fr 1fr;
+  height: 34px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fff;
+}
+
+.mode-toggle button {
+  min-width: 48px;
+  padding: 0 10px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 620;
+}
+
+.mode-toggle button + button {
+  border-left: 1px solid var(--line);
+}
+
+.mode-toggle button.active {
+  background: #3a5a78;
+  color: #fffdfa;
+}
+
+.mode-toggle button[data-mode="claude_code"].active {
+  background: #7a4ca8;
+}
+
+body.mode-claude_code .composer,
+body.mode-claude_code #ccImportBtn[hidden] {
+  display: none !important;
+}
+
+body.mode-claude_code .conversation-pane {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+body.mode-claude_code #deleteBtn,
+body.mode-claude_code #noteEditBtn,
+body.mode-claude_code #noteSaveBtn,
+body.mode-claude_code #noteProjectBtn {
+  display: none;
+}
+
+body.mode-claude_code .conversation-list::before {
+  content: "🕰 历史记录 · 只读";
+  display: block;
+  margin: -8px -16px 12px;
+  padding: 6px 16px;
+  background: rgba(122, 76, 168, 0.08);
+  color: rgba(80, 40, 120, 0.85);
+  font-size: 11px;
+  font-weight: 620;
 }
 
 .icon-button {
@@ -646,6 +712,12 @@ pre {
   border-radius: var(--radius);
   background: rgba(255, 253, 250, 0.88);
   box-shadow: 0 10px 30px rgba(31, 41, 55, 0.1);
+  cursor: grab;
+  touch-action: none;
+}
+
+#miniMap.dragging {
+  cursor: grabbing;
 }
 
 .composer {
@@ -857,7 +929,7 @@ pre {
 
 .side-tabs {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -865,11 +937,16 @@ pre {
 }
 
 .side-tabs button {
+  min-width: 0;
   height: 32px;
+  padding: 0 4px;
+  overflow: hidden;
   background: transparent;
   color: var(--muted);
   font-size: 12px;
   font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .side-tabs button + button {
@@ -926,6 +1003,7 @@ pre {
 
 .bubble-row {
   display: flex;
+  min-width: 0;
   margin: 0 0 12px;
 }
 
@@ -938,8 +1016,10 @@ pre {
 }
 
 .chat-bubble {
+  min-width: 0;
   max-width: 92%;
   padding: 9px 11px;
+  overflow-wrap: anywhere;
   border: 1px solid var(--line);
   border-radius: 8px;
   box-shadow: 0 8px 24px rgba(31, 41, 55, 0.07);
@@ -1301,28 +1381,23 @@ pre {
 .node-note-preview {
   position: fixed;
   z-index: 25;
-  width: min(320px, calc(100vw - 20px));
-  max-height: 260px;
+  width: min(420px, calc(100vw - 20px));
+  max-height: min(70vh, 600px);
   padding: 10px;
-  overflow: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: #fffdfa;
   box-shadow: var(--shadow);
   color: var(--text);
+  pointer-events: auto;
 }
 
 .node-note-preview pre {
-  max-height: 220px;
-  overflow: hidden;
   color: var(--text);
   font-size: 12px;
   line-height: 18px;
-}
-
-.node-note-preview .markdown-body {
-  max-height: 220px;
-  overflow: hidden;
 }
 
 .node-prompt-preview {

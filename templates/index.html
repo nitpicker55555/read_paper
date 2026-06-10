@@ -16,10 +16,15 @@
             <span id="workspaceLabel"></span>
           </div>
         </div>
+        <div class="mode-toggle" aria-label="数据来源">
+          <button id="modeLiveBtn" class="active" data-mode="live" type="button">实时</button>
+          <button id="modeHistoryBtn" data-mode="claude_code" type="button">历史</button>
+        </div>
         <label class="project-select">
-          <span>项目</span>
+          <span id="projectSelectLabel">项目</span>
           <select id="projectSelect"></select>
         </label>
+        <button id="ccImportBtn" class="icon-button" type="button" title="导入 Claude Code 项目（直接读取本地 ~/.claude/projects）" hidden>📥</button>
         <label class="search-box">
           <span>⌕</span>
           <input id="searchInput" type="search" placeholder="搜索节点" autocomplete="off" />

@@ -1174,6 +1174,190 @@ def api_accounts() -> Response:
     return jsonify({"managed_by_backend": True, "selection": "fixed"})
 
 
+CLAUDE_PROJECTS_DIR = Path(
+    os.environ.get("CLAUDE_PROJECTS_DIR", Path.home() / ".claude" / "projects")
+)
+
+
+def claude_code_slug(project_path: str) -> str:
+    return re.sub(r"[/_]", "-", str(project_path).rstrip("/"))
+
+
+def _user_text_blocks(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: List[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = str(block.get("text") or "").strip()
+                if text:
+                    parts.append(text)
+        return "\n\n".join(parts)
+    return ""
+
+
+def _is_claude_user_prompt(msg: Dict[str, Any]) -> bool:
+    if msg.get("type") != "user":
+        return False
+    content = (msg.get("message") or {}).get("content")
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                return False
+    return bool(_user_text_blocks(content))
+
+
+def _count_tool_uses(msg: Dict[str, Any]) -> int:
+    content = (msg.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return 0
+    return sum(1 for b in content if isinstance(b, dict) and b.get("type") == "tool_use")
+
+
+def _assistant_usage(msg: Dict[str, Any]) -> Tuple[int, int]:
+    usage = (msg.get("message") or {}).get("usage") or {}
+    prompt = int(usage.get("input_tokens") or 0)
+    prompt += int(usage.get("cache_creation_input_tokens") or 0)
+    prompt += int(usage.get("cache_read_input_tokens") or 0)
+    completion = int(usage.get("output_tokens") or 0)
+    return prompt, completion
+
+
+def read_claude_code_nodes(cc_dir: Path) -> List[Dict[str, Any]]:
+    raw: Dict[str, Dict[str, Any]] = {}
+    for jsonl_path in sorted(cc_dir.glob("*.jsonl")):
+        try:
+            with jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or not line.startswith("{"):
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    uuid_ = msg.get("uuid")
+                    if uuid_ and uuid_ not in raw:
+                        raw[uuid_] = msg
+        except OSError:
+            continue
+
+    def find_user_parent(uuid_: str) -> Optional[str]:
+        seen = set()
+        msg = raw.get(uuid_)
+        if not msg:
+            return None
+        parent = msg.get("parentUuid")
+        while parent and parent not in seen:
+            seen.add(parent)
+            p = raw.get(parent)
+            if not p:
+                return None
+            if _is_claude_user_prompt(p):
+                return parent
+            parent = p.get("parentUuid")
+        return None
+
+    user_uuids = [u for u, m in raw.items() if _is_claude_user_prompt(m)]
+    descendants_of: Dict[str, List[Dict[str, Any]]] = {u: [] for u in user_uuids}
+
+    for uuid_, msg in raw.items():
+        if _is_claude_user_prompt(msg):
+            continue
+        owner = find_user_parent(uuid_)
+        if owner and owner in descendants_of:
+            descendants_of[owner].append(msg)
+
+    nodes: List[Dict[str, Any]] = []
+    for uuid_ in user_uuids:
+        user_msg = raw[uuid_]
+        parent_user = find_user_parent(uuid_)
+        prompt_text = _user_text_blocks((user_msg.get("message") or {}).get("content"))
+
+        descendants = descendants_of.get(uuid_, [])
+        descendants.sort(key=lambda m: m.get("timestamp") or "")
+
+        answer_parts: List[str] = []
+        tools_count = 0
+        prompt_tokens = 0
+        completion_tokens = 0
+        model = ""
+        for d in descendants:
+            if d.get("type") != "assistant":
+                continue
+            msg = d.get("message") or {}
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = str(block.get("text") or "").strip()
+                        if text:
+                            answer_parts.append(text)
+            elif isinstance(content, str) and content.strip():
+                answer_parts.append(content.strip())
+            tools_count += _count_tool_uses(d)
+            pt, ct = _assistant_usage(d)
+            prompt_tokens += pt
+            completion_tokens += ct
+            if not model and msg.get("model"):
+                model = str(msg.get("model"))
+
+        answer = "\n\n".join(answer_parts)
+        last_ts = (descendants[-1].get("timestamp") if descendants else user_msg.get("timestamp")) or ""
+
+        nodes.append({
+            "id": f"cc:{uuid_}",
+            "parent_id": f"cc:{parent_user}" if parent_user else None,
+            "title": compact_title(prompt_text or "（空消息）"),
+            "prompt": prompt_text,
+            "answer": answer,
+            "status": "done",
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+            "tools_count": tools_count,
+            "attachments": [],
+            "workspace_refs": [],
+            "raw_events": [],
+            "note_md": "",
+            "model": model,
+            "cwd": user_msg.get("cwd") or "",
+            "created_at": user_msg.get("timestamp") or "",
+            "completed_at": last_ts,
+            "updated_at": last_ts,
+            "archived": False,
+            "bookmarked": False,
+            "codex_session_id": user_msg.get("sessionId") or "",
+            "source": "claude_code",
+        })
+
+    return nodes
+
+
+@app.get("/api/claude-code/tree")
+def api_claude_code_tree() -> Response:
+    project_path = (request.args.get("path") or "").strip()
+    if not project_path:
+        return jsonify({"error": "path 不能为空"}), 400
+    slug = claude_code_slug(project_path)
+    cc_dir = CLAUDE_PROJECTS_DIR / slug
+    if not cc_dir.exists() or not cc_dir.is_dir():
+        return jsonify({
+            "error": f"未找到 Claude Code 记录目录：{cc_dir}",
+            "slug": slug,
+        }), 404
+    try:
+        nodes = read_claude_code_nodes(cc_dir)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"读取失败：{exc}"}), 500
+    return jsonify({
+        "nodes": nodes,
+        "source_path": project_path,
+        "claude_dir": str(cc_dir),
+    })
+
+
 @app.post("/api/ask")
 def api_ask() -> Response:
     payload = request.get_json(silent=True) or {}
