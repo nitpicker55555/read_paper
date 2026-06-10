@@ -1006,6 +1006,28 @@ body.mode-claude_code .conversation-list::before {
   white-space: nowrap;
 }
 
+button.meta-pill {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.meta-pill.resume-pill {
+  border-color: rgba(122, 76, 168, 0.4);
+  background: rgba(155, 89, 182, 0.08);
+  color: rgba(80, 40, 120, 0.9);
+  font-weight: 620;
+}
+
+.meta-pill.resume-pill:hover {
+  background: rgba(155, 89, 182, 0.16);
+}
+
+.meta-pill.resume-pill.copied {
+  background: rgba(40, 124, 116, 0.18);
+  border-color: rgba(40, 124, 116, 0.5);
+  color: #1f5a52;
+}
+
 .conversation-list {
   min-height: 0;
   padding: 16px;

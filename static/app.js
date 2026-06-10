@@ -48,6 +48,7 @@ const state = {
   projectNotesProjectId: null,
   noteContextText: "",
   scrollConversationToLatest: false,
+  projectStats: new Map(),
   mode: "live",
   liveSnapshot: null,
   ccSnapshot: null,
@@ -639,6 +640,34 @@ function rebuildProjects() {
   state.projects = state.allNodes
     .filter((node) => !node.parent_id || !allById.has(node.parent_id))
     .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+  computeProjectStats(allById);
+}
+
+function computeProjectStats(allById) {
+  const childMap = new Map();
+  for (const node of state.allNodes) {
+    const parent = node.parent_id && allById.has(node.parent_id) ? node.parent_id : null;
+    if (!childMap.has(parent)) childMap.set(parent, []);
+    childMap.get(parent).push(node.id);
+  }
+  const stats = new Map();
+  for (const project of state.projects) {
+    let nodes = 0;
+    let leaves = 0;
+    const stack = [project.id];
+    const seen = new Set();
+    while (stack.length) {
+      const id = stack.pop();
+      if (seen.has(id)) continue;
+      seen.add(id);
+      nodes += 1;
+      const kids = childMap.get(id) || [];
+      if (kids.length === 0) leaves += 1;
+      for (const k of kids) stack.push(k);
+    }
+    stats.set(project.id, { nodes, leaves });
+  }
+  state.projectStats = stats;
 }
 
 function ensureSelectedProject(keepSelection) {
@@ -745,7 +774,9 @@ function renderProjectSelect() {
   for (const project of state.projects) {
     const option = document.createElement("option");
     option.value = project.id;
-    option.textContent = compact(project.title || project.prompt || "未命名项目", 38);
+    const stats = state.projectStats && state.projectStats.get(project.id);
+    const suffix = stats ? `  ·  ${stats.nodes}节 / ${stats.leaves}叶` : "";
+    option.textContent = compact(project.title || project.prompt || "未命名项目", 30) + suffix;
     options.push(option);
   }
   els.projectSelect.replaceChildren(...options);
@@ -1487,6 +1518,77 @@ function renderNotePanel() {
   els.noteRendered.replaceChildren(rendered);
 }
 
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // fall through to legacy path
+    }
+  }
+  // Legacy fallback that works on plain http (LAN access etc).
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.top = "0";
+  textarea.style.left = "0";
+  textarea.style.width = "1px";
+  textarea.style.height = "1px";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  const prevSelection = document.getSelection().rangeCount > 0
+    ? document.getSelection().getRangeAt(0)
+    : null;
+  textarea.focus();
+  textarea.select();
+  let ok = false;
+  try {
+    ok = document.execCommand("copy");
+  } catch {
+    ok = false;
+  }
+  document.body.removeChild(textarea);
+  if (prevSelection) {
+    const sel = document.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(prevSelection);
+  }
+  return ok;
+}
+
+function makeResumePill(node) {
+  const sessionId = String(node.codex_session_id || node.own_session_id || "").trim();
+  const messageUuid = String(node.resume_message_uuid || "").trim();
+  if (!sessionId || !messageUuid) return null;
+  const pill = document.createElement("button");
+  pill.type = "button";
+  pill.className = "meta-pill resume-pill";
+  const shortId = sessionId.length > 12 ? `${sessionId.slice(0, 8)}…` : sessionId;
+  pill.textContent = `↻ resume @${shortId}`;
+  // Hidden flag --resume-session-at <message-uuid> truncates the session at that exact
+  // message and resumes from it. Works for any user prompt regardless of last-prompt state.
+  const command = `claude --resume ${sessionId} --resume-session-at ${messageUuid}`;
+  pill.title = `点击复制：\n${command}\n\n会精确停在此节点（使用 --resume-session-at 隐藏 flag）`;
+  pill.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    const ok = await copyTextToClipboard(command);
+    if (ok) {
+      const original = pill.textContent;
+      pill.textContent = "已复制 ✓";
+      pill.classList.add("copied");
+      setTimeout(() => {
+        pill.textContent = original;
+        pill.classList.remove("copied");
+      }, 1200);
+    } else {
+      window.prompt("自动复制失败，请手动复制：", command);
+    }
+  });
+  return pill;
+}
+
 function renderConversation() {
   const node = selectedNode();
   const disabled = !node;
@@ -1511,12 +1613,19 @@ function renderConversation() {
     `${node.tools_count || 0} tools`,
     node.completed_at || node.created_at || "",
   ].filter(Boolean);
-  els.detailMeta.replaceChildren(...meta.map((item) => {
+  const metaEls = meta.map((item) => {
     const span = document.createElement("span");
     span.className = "meta-pill";
     span.textContent = item;
     return span;
-  }));
+  });
+
+  if (state.mode === "claude_code") {
+    const pill = makeResumePill(node);
+    if (pill) metaEls.push(pill);
+  }
+
+  els.detailMeta.replaceChildren(...metaEls);
 
   const bubbles = [];
   for (const item of selectedConversationPath()) {

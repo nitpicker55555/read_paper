@@ -1226,7 +1226,11 @@ def _assistant_usage(msg: Dict[str, Any]) -> Tuple[int, int]:
 
 def read_claude_code_nodes(cc_dir: Path) -> List[Dict[str, Any]]:
     raw: Dict[str, Dict[str, Any]] = {}
+    # For each session file, capture the LAST `last-prompt` event's leafUuid.
+    # That is the message --resume <session_id> will land on.
+    session_resume_leaf: Dict[str, str] = {}
     for jsonl_path in sorted(cc_dir.glob("*.jsonl")):
+        session_id = jsonl_path.stem
         try:
             with jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
                 for line in f:
@@ -1236,6 +1240,9 @@ def read_claude_code_nodes(cc_dir: Path) -> List[Dict[str, Any]]:
                     try:
                         msg = json.loads(line)
                     except json.JSONDecodeError:
+                        continue
+                    if msg.get("type") == "last-prompt" and msg.get("leafUuid"):
+                        session_resume_leaf[session_id] = msg["leafUuid"]
                         continue
                     uuid_ = msg.get("uuid")
                     if uuid_ and uuid_ not in raw:
@@ -1260,6 +1267,51 @@ def read_claude_code_nodes(cc_dir: Path) -> List[Dict[str, Any]]:
         return None
 
     user_uuids = [u for u, m in raw.items() if _is_claude_user_prompt(m)]
+
+    # session_id -> user_prompt uuid that --resume lands on (walk up from leafUuid until user prompt)
+    resume_user_by_session: Dict[str, str] = {}
+    # inverse: user_prompt uuid -> list of session_ids whose resume lands here
+    sessions_resuming_to: Dict[str, List[str]] = {}
+    for sid, leaf_uuid in session_resume_leaf.items():
+        cursor = leaf_uuid
+        seen: set = set()
+        while cursor and cursor not in seen:
+            seen.add(cursor)
+            m = raw.get(cursor)
+            if not m:
+                break
+            if _is_claude_user_prompt(m):
+                resume_user_by_session[sid] = cursor
+                sessions_resuming_to.setdefault(cursor, []).append(sid)
+                break
+            cursor = m.get("parentUuid")
+
+    # children map among user prompts (for BFS to find branch-end resume target)
+    user_children: Dict[Optional[str], List[str]] = {}
+    for u in user_uuids:
+        parent = find_user_parent(u)
+        user_children.setdefault(parent, []).append(u)
+
+    # For each user node, find the nearest descendant (BFS) that is an exact resume target.
+    # If found, that descendant's session is the "branch-end resume" for this node.
+    branch_end_session: Dict[str, str] = {}
+    branch_end_node: Dict[str, str] = {}
+    for u in user_uuids:
+        if u in sessions_resuming_to:
+            continue
+        queue = list(user_children.get(u, []))
+        visited = {u, *queue}
+        while queue:
+            cur = queue.pop(0)
+            if cur in sessions_resuming_to:
+                branch_end_session[u] = sessions_resuming_to[cur][-1]
+                branch_end_node[u] = cur
+                break
+            for child in user_children.get(cur, []):
+                if child not in visited:
+                    visited.add(child)
+                    queue.append(child)
+
     descendants_of: Dict[str, List[Dict[str, Any]]] = {u: [] for u in user_uuids}
 
     for uuid_, msg in raw.items():
@@ -1306,6 +1358,22 @@ def read_claude_code_nodes(cc_dir: Path) -> List[Dict[str, Any]]:
         answer = "\n\n".join(answer_parts)
         last_ts = (descendants[-1].get("timestamp") if descendants else user_msg.get("timestamp")) or ""
 
+        # With --resume-session-at we can always resume to this exact message.
+        # The session arg is the file this user prompt lives in; the message arg is its uuid.
+        own_session = user_msg.get("sessionId") or ""
+        resume_sessions = sessions_resuming_to.get(uuid_, [])
+        # Keep these informational fields for the UI to optionally surface.
+        if resume_sessions:
+            resume_kind = "exact"
+            resume_descendant = ""
+        elif uuid_ in branch_end_session:
+            resume_kind = "branch_end"
+            resume_descendant = branch_end_node[uuid_]
+        else:
+            resume_kind = "fallback"
+            resume_descendant = ""
+        primary_resume = own_session
+
         nodes.append({
             "id": f"cc:{uuid_}",
             "parent_id": f"cc:{parent_user}" if parent_user else None,
@@ -1328,7 +1396,12 @@ def read_claude_code_nodes(cc_dir: Path) -> List[Dict[str, Any]]:
             "updated_at": last_ts,
             "archived": False,
             "bookmarked": False,
-            "codex_session_id": user_msg.get("sessionId") or "",
+            "codex_session_id": primary_resume,
+            "resume_sessions": resume_sessions,
+            "resume_kind": resume_kind,
+            "resume_descendant_id": f"cc:{resume_descendant}" if resume_descendant else "",
+            "own_session_id": own_session,
+            "resume_message_uuid": uuid_,
             "source": "claude_code",
         })
 
