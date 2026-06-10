@@ -1,12 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import mimetypes
 import os
 import re
-import shutil
 import sqlite3
-import subprocess
 import threading
 import uuid
 from contextlib import contextmanager
@@ -19,19 +18,20 @@ from werkzeug.utils import secure_filename
 
 
 BASE_DIR = Path(__file__).resolve().parent
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(BASE_DIR / ".env")
+except ImportError:
+    pass
+
+from sub_pool_client import PooledCodexClient  # noqa: E402  -- imported after .env load
+
 DATA_DIR = Path(os.environ.get("CODEX_QA_DATA_DIR", BASE_DIR / "instance"))
 DB_PATH = DATA_DIR / "codex_qa.sqlite"
 WORK_DIR = Path(os.environ.get("CODEX_QA_WORKDIR", DATA_DIR / "workspace"))
 UPLOAD_DIR = WORK_DIR / "uploads"
 RUN_DIR = DATA_DIR / "runs"
-CODEX_HOME_DIR = DATA_DIR / "codex_homes"
-CODEX_AUTH_FILE = Path(
-    os.environ.get(
-        "CODEX_AUTH_FILE",
-        "/Users/puzhen/PycharmProjects/datagen_mcp_toolathlon_ver_2/codex_token/auth_outlook_puzhen.json",
-    )
-)
-USER_CONFIG = Path(os.environ.get("CODEX_USER_CONFIG", Path.home() / ".codex" / "config.toml"))
 
 CODEX_TIMEOUT_SECONDS = int(os.environ.get("CODEX_TIMEOUT_SECONDS", "1200"))
 CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.5").strip() or "gpt-5.5"
@@ -83,7 +83,7 @@ def parse_iso(value: Optional[str]) -> datetime:
 
 
 def ensure_dirs() -> None:
-    for path in (DATA_DIR, WORK_DIR, UPLOAD_DIR, RUN_DIR, CODEX_HOME_DIR):
+    for path in (DATA_DIR, WORK_DIR, UPLOAD_DIR, RUN_DIR):
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -479,31 +479,6 @@ def account_usage_map() -> Dict[str, int]:
     return {row["name"]: int(row["used_tokens"]) for row in rows}
 
 
-def select_account() -> Dict[str, Any]:
-    if not CODEX_AUTH_FILE.exists():
-        raise RuntimeError(f"指定的 Codex auth 文件不存在：{CODEX_AUTH_FILE}")
-    return {
-        "name": CODEX_AUTH_FILE.stem,
-        "auth_path": str(CODEX_AUTH_FILE),
-        "auth_file": CODEX_AUTH_FILE.name,
-        "reason": "固定使用用户指定的 Codex auth 文件",
-    }
-
-
-def prepare_codex_home(account: Dict[str, Any]) -> Path:
-    safe_name = secure_filename(account["name"]) or "account"
-    home = CODEX_HOME_DIR / safe_name
-    home.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(account["auth_path"], home / "auth.json")
-    try:
-        os.chmod(home / "auth.json", 0o600)
-    except OSError:
-        pass
-    if USER_CONFIG.exists():
-        shutil.copy2(USER_CONFIG, home / "config.toml")
-    return home
-
-
 def make_attachment_context(files: List[Dict[str, Any]]) -> str:
     if not files:
         return "无"
@@ -865,83 +840,74 @@ def parse_jsonl_line(line: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def run_codex_for_node(node_id: str) -> None:
+async def _run_codex_for_node_async(node_id: str) -> None:
     node = get_node(node_id)
     if not node:
         return
 
+    files = get_files([item["id"] for item in node.get("attachments", [])])
+    prompt_text = build_codex_prompt(node.get("parent_id"), node["prompt"], files, node.get("workspace_refs") or [])
+    run_path = RUN_DIR / node_id
+    run_path.mkdir(parents=True, exist_ok=True)
+    final_message_path = run_path / "final.md"
+    before_workspace = workspace_snapshot()
+
+    stdout_lines: List[str] = []
+    events: List[Dict[str, Any]] = []
+    stderr_text = ""
+    returncode: Optional[int] = None
+    timed_out = False
+    account_name: Optional[str] = None
+    lease_id: Optional[str] = None
+    rate_limited = False
+
     try:
-        account = select_account()
-        files = get_files([item["id"] for item in node.get("attachments", [])])
-        prompt_text = build_codex_prompt(node.get("parent_id"), node["prompt"], files, node.get("workspace_refs") or [])
-        codex_home = prepare_codex_home(account)
-        run_path = RUN_DIR / node_id
-        run_path.mkdir(parents=True, exist_ok=True)
-        final_message_path = run_path / "final.md"
-        before_workspace = workspace_snapshot()
+        async with PooledCodexClient(required_model=CODEX_MODEL or None) as client:
+            account_name = client.account
+            lease_id = client.lease_id
+            update_node(
+                node_id,
+                status="running",
+                account_name=account_name,
+                account_path=f"sub-pool lease {lease_id or ''}".strip(),
+                account_reason=f"sub-pool 自动分配（model={CODEX_MODEL}）",
+                model=CODEX_MODEL or None,
+            )
 
-        update_node(
-            node_id,
-            status="running",
-            account_name=account["name"],
-            account_path=account["auth_file"],
-            account_reason=account["reason"],
-            model=CODEX_MODEL or None,
-        )
+            cmd = [
+                "codex",
+                "--search",
+                "-c",
+                f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"',
+                "-c",
+                f'service_tier="{CODEX_SERVICE_TIER}"',
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "--ignore-rules",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-C",
+                str(WORK_DIR),
+                "-o",
+                str(final_message_path),
+                "-m",
+                CODEX_MODEL,
+                "-",
+            ]
 
-        cmd = [
-            "codex",
-            "--search",
-            "-c",
-            f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"',
-            "-c",
-            f'service_tier="{CODEX_SERVICE_TIER}"',
-            "exec",
-            "--json",
-            "--skip-git-repo-check",
-            "--ignore-rules",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "-C",
-            str(WORK_DIR),
-            "-o",
-            str(final_message_path),
-        ]
-        cmd.extend(["-m", CODEX_MODEL])
-        cmd.append("-")
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(BASE_DIR),
+                env=client.env,
+            )
 
-        env = os.environ.copy()
-        env["CODEX_HOME"] = str(codex_home)
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            cwd=str(BASE_DIR),
-            env=env,
-        )
-
-        timed_out = {"value": False}
-
-        def kill_on_timeout() -> None:
-            timed_out["value"] = True
-            try:
-                proc.kill()
-            except OSError:
-                pass
-
-        timer = threading.Timer(CODEX_TIMEOUT_SECONDS, kill_on_timeout)
-        timer.start()
-        stdout_lines: List[str] = []
-        events: List[Dict[str, Any]] = []
-        try:
-            if proc.stdin:
-                proc.stdin.write(prompt_text)
-                proc.stdin.close()
-
-            if proc.stdout:
-                for line in proc.stdout:
+            async def pump_stdout() -> None:
+                assert proc.stdout is not None
+                async for raw in proc.stdout:
+                    line = raw.decode("utf-8", errors="replace")
                     stdout_lines.append(line)
                     event = parse_jsonl_line(line)
                     if not event:
@@ -954,69 +920,105 @@ def run_codex_for_node(node_id: str) -> None:
                         tools_count=collect_tools_count(events),
                         codex_session_id=find_first_key(events, ("thread_id", "session_id", "sessionId", "conversation_id")),
                     )
-            returncode = proc.wait()
-            stderr_text = proc.stderr.read() if proc.stderr else ""
-        finally:
-            timer.cancel()
 
-        stdout_text = "".join(stdout_lines)
-        answer = ""
-        if final_message_path.exists():
-            answer = final_message_path.read_text(encoding="utf-8", errors="replace").strip()
-        if not answer:
-            answer = extract_answer_from_events(events).strip()
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.write(prompt_text.encode("utf-8"))
+                    await proc.stdin.drain()
+                    proc.stdin.close()
+                await asyncio.wait_for(pump_stdout(), timeout=CODEX_TIMEOUT_SECONDS)
+                returncode = await asyncio.wait_for(proc.wait(), timeout=30)
+                stderr_bytes = await proc.stderr.read() if proc.stderr else b""
+                stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+            except asyncio.TimeoutError:
+                timed_out = True
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    returncode = await asyncio.wait_for(proc.wait(), timeout=10)
+                except asyncio.TimeoutError:
+                    returncode = -1
+                if proc.stderr:
+                    try:
+                        stderr_bytes = await asyncio.wait_for(proc.stderr.read(), timeout=5)
+                        stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+                    except asyncio.TimeoutError:
+                        pass
 
-        record_workspace_changes(node_id, before_workspace)
-        usage = collect_usage(events, prompt_text, answer or stderr_text)
-        session_id = find_first_key(events, ("session_id", "sessionId", "conversation_id"))
-        tools_count = collect_tools_count(events)
-        public_events = trim_events_for_storage(events)
+            stdout_text = "".join(stdout_lines)
+            combined = f"{stderr_text}\n{stdout_text}".lower()
+            if returncode and returncode != 0 and ("429" in combined or "rate limit" in combined or "rate_limit" in combined):
+                rate_limited = True
+                try:
+                    await client.report_error("429", (stderr_text or stdout_text)[-500:])
+                except Exception:
+                    pass
+    except Exception as exc:  # noqa: BLE001
+        update_node(node_id, status="failed", error=f"sub-pool 调用失败：{exc}", completed_at=now_iso())
+        return
 
-        if timed_out["value"]:
-            update_node(
-                node_id,
-                status="failed",
-                error=f"Codex 超时：超过 {CODEX_TIMEOUT_SECONDS} 秒未完成",
-                raw_events_json=json.dumps(public_events, ensure_ascii=False),
-                completed_at=now_iso(),
-            )
-        elif returncode == 0 and answer:
-            update_node(
-                node_id,
-                status="done",
-                answer=answer,
-                codex_session_id=session_id,
-                prompt_tokens=usage["prompt_tokens"],
-                completion_tokens=usage["completion_tokens"],
-                total_tokens=usage["total_tokens"],
-                tools_count=tools_count,
-                raw_events_json=json.dumps(public_events, ensure_ascii=False),
-                completed_at=now_iso(),
-                error=None,
-            )
-            add_account_usage(account["name"], node_id, usage["total_tokens"])
-        else:
-            error = stderr_text.strip() or stdout_text.strip() or "Codex 执行失败"
-            update_node(
-                node_id,
-                status="failed",
-                answer=answer,
-                raw_events_json=json.dumps(public_events, ensure_ascii=False),
-                error=error[-8000:],
-                completed_at=now_iso(),
-                prompt_tokens=usage["prompt_tokens"],
-                completion_tokens=usage["completion_tokens"],
-                total_tokens=usage["total_tokens"],
-            )
-            add_account_usage(account["name"], node_id, usage["total_tokens"])
-    except subprocess.TimeoutExpired:
+    stdout_text = "".join(stdout_lines)
+    answer = ""
+    if final_message_path.exists():
+        answer = final_message_path.read_text(encoding="utf-8", errors="replace").strip()
+    if not answer:
+        answer = extract_answer_from_events(events).strip()
+
+    record_workspace_changes(node_id, before_workspace)
+    usage = collect_usage(events, prompt_text, answer or stderr_text)
+    session_id = find_first_key(events, ("session_id", "sessionId", "conversation_id"))
+    tools_count = collect_tools_count(events)
+    public_events = trim_events_for_storage(events)
+
+    if timed_out:
         update_node(
             node_id,
             status="failed",
             error=f"Codex 超时：超过 {CODEX_TIMEOUT_SECONDS} 秒未完成",
+            raw_events_json=json.dumps(public_events, ensure_ascii=False),
             completed_at=now_iso(),
         )
-    except Exception as exc:  # noqa: BLE001 - surface background worker failures in UI
+    elif returncode == 0 and answer:
+        update_node(
+            node_id,
+            status="done",
+            answer=answer,
+            codex_session_id=session_id,
+            prompt_tokens=usage["prompt_tokens"],
+            completion_tokens=usage["completion_tokens"],
+            total_tokens=usage["total_tokens"],
+            tools_count=tools_count,
+            raw_events_json=json.dumps(public_events, ensure_ascii=False),
+            completed_at=now_iso(),
+            error=None,
+        )
+        if account_name:
+            add_account_usage(account_name, node_id, usage["total_tokens"])
+    else:
+        error = stderr_text.strip() or stdout_text.strip() or "Codex 执行失败"
+        if rate_limited:
+            error = f"[已上报 sub-pool 冷却该账号] {error}"
+        update_node(
+            node_id,
+            status="failed",
+            answer=answer,
+            raw_events_json=json.dumps(public_events, ensure_ascii=False),
+            error=error[-8000:],
+            completed_at=now_iso(),
+            prompt_tokens=usage["prompt_tokens"],
+            completion_tokens=usage["completion_tokens"],
+            total_tokens=usage["total_tokens"],
+        )
+        if account_name:
+            add_account_usage(account_name, node_id, usage["total_tokens"])
+
+
+def run_codex_for_node(node_id: str) -> None:
+    try:
+        asyncio.run(_run_codex_for_node_async(node_id))
+    except Exception as exc:  # noqa: BLE001
         update_node(node_id, status="failed", error=str(exc), completed_at=now_iso())
 
 

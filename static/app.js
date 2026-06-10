@@ -20,7 +20,7 @@ const state = {
   workspacePreviewFile: null,
   workspaceOpen: localStorage.getItem("workspaceDrawerOpen") === "1",
   workDir: "",
-  selectedProjectId: localStorage.getItem("selectedProjectId") || null,
+  selectedProjectId: "__new__",
   selectedId: null,
   parentId: null,
   fileIds: new Set(),
@@ -611,7 +611,7 @@ function renderProjectSelect() {
   const options = [];
   const newOption = document.createElement("option");
   newOption.value = "__new__";
-  newOption.textContent = "say something";
+  newOption.textContent = "new session";
   options.push(newOption);
   for (const project of state.projects) {
     const option = document.createElement("option");
@@ -778,7 +778,7 @@ function positionNodeNotePreview(target) {
 }
 
 function showNodeNotePreview(node, target) {
-  const note = firstLines(noteTextForNode(node), 10);
+  const note = String(noteTextForNode(node) || "").trim();
   if (!note) return;
   els.nodeNotePreview.replaceChildren(renderMarkdown(note));
   els.nodeNotePreview.hidden = false;
@@ -1064,6 +1064,16 @@ function describeTool(item) {
       status: item.status || "in_progress",
     };
   }
+  if (type === "summary") {
+    const text = item.text || item.summary || item.content || item.message || "";
+    return {
+      name: "上下文压缩",
+      detail: "Codex 自动压缩了历史以节省上下文",
+      output: text,
+      status: item.status || "completed",
+      kind: "summary",
+    };
+  }
   return {
     name: type.replaceAll("_", " "),
     detail: item.command || item.name || item.query || "",
@@ -1078,7 +1088,7 @@ function toolCallsForNode(node) {
     const item = event.item;
     if (!item || typeof item !== "object") continue;
     const type = item.type || "";
-    if (!["command_execution", "web_search"].includes(type) && !type.includes("tool")) continue;
+    if (!["command_execution", "web_search", "summary"].includes(type) && !type.includes("tool")) continue;
     const key = item.id || `${type}-${calls.size}`;
     const described = describeTool(item);
     const eventType = event.type || "";
@@ -1096,14 +1106,21 @@ function renderToolCalls(tools) {
   list.className = "tool-list";
   for (const tool of tools) {
     const row = document.createElement("div");
-    row.className = `tool-call ${tool.status === "completed" ? "completed" : "running"}`;
+    const classes = ["tool-call", tool.status === "completed" ? "completed" : "running"];
+    if (tool.kind) classes.push(tool.kind);
+    if (tool.kind === "summary") classes.push("collapsed");
+    row.className = classes.join(" ");
     const spinner = document.createElement("span");
     spinner.className = "tool-spinner";
     const text = document.createElement("div");
     text.className = "tool-text";
     const title = document.createElement("div");
     title.className = "tool-title";
-    title.textContent = tool.status === "completed" ? `${tool.name} 完成` : `正在调用 ${tool.name}`;
+    if (tool.kind === "summary") {
+      title.textContent = tool.name;
+    } else {
+      title.textContent = tool.status === "completed" ? `${tool.name} 完成` : `正在调用 ${tool.name}`;
+    }
     const detail = document.createElement("div");
     detail.className = "tool-detail";
     detail.textContent = tool.detail || "-";
@@ -1111,8 +1128,11 @@ function renderToolCalls(tools) {
     if (tool.output) {
       const output = document.createElement("pre");
       output.className = "tool-output";
-      output.textContent = compact(tool.output, 260);
+      output.textContent = tool.kind === "summary" ? tool.output : compact(tool.output, 260);
       text.appendChild(output);
+    }
+    if (tool.kind === "summary") {
+      row.addEventListener("click", () => row.classList.toggle("collapsed"));
     }
     row.append(spinner, text);
     list.appendChild(row);
@@ -1727,7 +1747,38 @@ function markdownFromNode(node) {
     }).join("\n")}\n`;
   }
   if (tag === "li") return markdownChildren(el);
+  if (tag === "table") return tableToMarkdown(el);
   return markdownChildren(el);
+}
+
+function tableToMarkdown(table) {
+  const rows = Array.from(table.querySelectorAll("tr")).filter((tr) => tr.cells && tr.cells.length);
+  if (!rows.length) return "";
+
+  const cellMarkdown = (cell) =>
+    cleanMarkdown(markdownChildren(cell))
+      .replace(/\|/g, "\\|")
+      .replace(/\s*\n+\s*/g, " ")
+      .trim() || " ";
+
+  const rowCells = (tr) => Array.from(tr.cells).map(cellMarkdown);
+  const headerCells = rowCells(rows[0]);
+  const bodyRows = rows.slice(1).map(rowCells);
+  const colCount = Math.max(headerCells.length, ...bodyRows.map((r) => r.length), 1);
+
+  const pad = (cells) => {
+    const out = cells.slice();
+    while (out.length < colCount) out.push(" ");
+    return out;
+  };
+
+  const lines = [];
+  lines.push(`| ${pad(headerCells).join(" | ")} |`);
+  lines.push(`| ${new Array(colCount).fill("---").join(" | ")} |`);
+  for (const row of bodyRows) {
+    lines.push(`| ${pad(row).join(" | ")} |`);
+  }
+  return `\n\n${lines.join("\n")}\n\n`;
 }
 
 function applyAncestorMarkdown(markdown, range) {
