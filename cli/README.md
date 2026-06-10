@@ -29,20 +29,38 @@ No deps — pure Python 3.9+ stdlib.
 ## Use
 
 Running `atr` with no arguments in an interactive terminal opens a two-step
-interactive flow: **project picker → action menu**. The project picker lists
-every directory under `~/.claude/projects/` sorted by most-recent activity,
-with the cwd's project pre-highlighted (`●`). Press Enter for the default
-project or arrow-key to another. Then pick an action from the second menu.
+interactive flow: **conversation-root picker → action menu**.
+
+A "project" here matches the Flask app's meaning: one root user prompt
+(parentUuid: null) plus the subtree growing from it. A single jsonl
+directory typically contains many such roots — the independent conversations
+you started in that path. The picker lists every root in the cwd's project
+dir (`~/.claude/projects/<slug>/`), sorted by latest activity. Each row
+shows the node count of the subtree, whether the root is natively reachable
+by stock `claude --resume` (`★`), the timestamp of the most recent activity
+in that subtree, and the root prompt itself.
+
+After you pick a root, the second menu (list / leaves / tree / search /
+resume / info) operates **only on that root's subtree**. The picked root is
+shown in the action menu header so you remember what's scoped.
+
+Press `a` inside the picker to widen the scope to every root across every
+project dir (handy when cd is in a directory with no project of its own).
+Pass `atr -a` to start in that mode.
 
 ```bash
-# interactive: pick project → pick action
+# interactive: pick root conversation → pick action
 atr
 
-# skip the project picker and use cwd directly
+# skip both pickers and operate on the whole jsonl dir at cwd
 atr -p .
 
-# skip the project picker, use a specific path
+# skip both pickers, use a specific path
 atr -p ~/path/to/your-project
+
+# non-interactive scoping to a specific root by uuid prefix
+atr -r 79c67796 list
+atr -r 79c67796 tree
 
 # only branch tails (leaf nodes — usually the most useful targets)
 atr leaves

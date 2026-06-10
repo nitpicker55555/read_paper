@@ -20,10 +20,40 @@ import re
 import shutil
 import subprocess
 import sys
+import unicodedata
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _vwidth(s: str) -> int:
+    """Display cells for `s` after stripping ANSI escapes. Counts East Asian
+    Wide/Fullwidth chars (CJK, fullwidth punctuation) as 2 cells."""
+    plain = _ANSI_RE.sub("", s)
+    n = 0
+    for c in plain:
+        n += 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+    return n
+
+
+def _truncate_w(s: str, max_w: int, ellipsis: str = "…") -> str:
+    """Truncate raw text (no ANSI inside) so visual width ≤ max_w."""
+    if max_w <= 0:
+        return ""
+    n = 0
+    out = []
+    cap = max(1, max_w - _vwidth(ellipsis))
+    for c in s:
+        cw = 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+        if n + cw > cap:
+            return "".join(out) + ellipsis
+        out.append(c)
+        n += cw
+    return "".join(out)
 
 
 CLAUDE_PROJECTS_DIR = Path(
@@ -425,7 +455,8 @@ def _print_summary(project_dir: Path, total: int, native: int, leaves: int) -> N
     )
 
 
-def _gather(path: str) -> Tuple[Path, Dict[str, dict], set, Dict[str, Tuple[dict, str]]]:
+def _gather(path: str, scope_root: Optional[str] = None
+            ) -> Tuple[Path, Dict[str, dict], set, Dict[str, Tuple[dict, str]]]:
     pd = project_dir_for(path)
     if not pd.exists():
         print(red(f"Claude Code project directory not found: {pd}"), file=sys.stderr)
@@ -433,6 +464,19 @@ def _gather(path: str) -> Tuple[Path, Dict[str, dict], set, Dict[str, Tuple[dict
         sys.exit(2)
     by_uuid, session_leaf = load_project(pd)
     nodes, native = build_nodes(by_uuid, session_leaf)
+    if scope_root:
+        # Allow uuid prefix match for the CLI -r flag.
+        matches = [u for u in nodes if u.startswith(scope_root)]
+        if not matches:
+            print(red(f"scope root uuid {scope_root!r} not found in this project"),
+                  file=sys.stderr)
+            sys.exit(2)
+        if len(matches) > 1:
+            print(red(f"scope root prefix {scope_root!r} is ambiguous"), file=sys.stderr)
+            sys.exit(2)
+        keep = _subtree(matches[0], nodes)
+        nodes = {u: nodes[u] for u in keep}
+        native = native & keep
     return pd, nodes, native, by_uuid
 
 
@@ -481,7 +525,7 @@ def _show_items(args, items: List[dict], nodes: Dict[str, dict], native: set,
 
 
 def cmd_browse(args) -> None:
-    pd, nodes, native, by_uuid = _gather(args.path)
+    pd, nodes, native, by_uuid = _gather(args.path, getattr(args, "scope_root", None))
     items = list(nodes.values())
     if args.leaves:
         items = [n for n in items if not n["children"]]
@@ -498,7 +542,7 @@ def cmd_browse(args) -> None:
 
 
 def cmd_search(args) -> None:
-    pd, nodes, native, by_uuid = _gather(args.path)
+    pd, nodes, native, by_uuid = _gather(args.path, getattr(args, "scope_root", None))
     q = args.query.lower()
     matches = [n for n in nodes.values() if q in n["text"].lower()]
     matches.sort(key=lambda n: n["timestamp"], reverse=True)
@@ -515,7 +559,7 @@ def cmd_search(args) -> None:
 
 def cmd_tree(args) -> None:
     """Dedicated tree-view command. Always tree, never pick."""
-    pd, nodes, native, _by_uuid = _gather(args.path)
+    pd, nodes, native, _by_uuid = _gather(args.path, getattr(args, "scope_root", None))
 
     def render(out):
         _emit(dim(f"project dir: {pd}"), out)
@@ -535,7 +579,7 @@ def cmd_tree(args) -> None:
 
 
 def cmd_resume(args) -> None:
-    pd, nodes, _native, by_uuid = _gather(args.path)
+    pd, nodes, _native, by_uuid = _gather(args.path, getattr(args, "scope_root", None))
     matches = [u for u in by_uuid if u.startswith(args.uuid)]
     if not matches:
         print(red(f"no uuid starts with {args.uuid!r}"), file=sys.stderr)
@@ -556,7 +600,7 @@ def cmd_resume(args) -> None:
 
 
 def cmd_info(args) -> None:
-    pd, nodes, native, by_uuid = _gather(args.path)
+    pd, nodes, native, by_uuid = _gather(args.path, getattr(args, "scope_root", None))
     matches = [u for u in nodes if u.startswith(args.uuid)]
     if not matches:
         print(red(f"no uuid starts with {args.uuid!r}"), file=sys.stderr)
@@ -607,6 +651,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("-p", "--path", default=None,
                     help="project path (default: pick interactively or use cwd)")
+    ap.add_argument("-r", "--root", default=None, dest="scope_root",
+                    help="scope to a specific root conversation (uuid prefix)")
+    ap.add_argument("-a", "--all", action="store_true", dest="all_projects",
+                    help="in the interactive picker, include roots from every "
+                         "~/.claude/projects/ dir, not just the one matching cwd")
     sub = ap.add_subparsers(dest="cmd")
 
     p_list = sub.add_parser("list", aliases=["ls"], help="list conversations, most recent first")
@@ -643,116 +692,189 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
-# ---------- project picker ----------
+# ---------- conversation-root picker ----------
+#
+# A "project" here matches the Flask app's meaning: one root user prompt
+# (parentUuid: null) plus the subtree growing from it. A single
+# ~/.claude/projects/<slug>/ directory can contain many such roots — they're
+# the independent conversations the user started while cd'd into that path.
 
-def _scan_projects() -> List[dict]:
-    """Walk CLAUDE_PROJECTS_DIR and return {slug, path, sessions, mtime}
-    entries, sorted by latest jsonl mtime (most recently active first)."""
-    base = CLAUDE_PROJECTS_DIR
-    if not base.exists():
-        return []
-    projects: List[dict] = []
-    for d in base.iterdir():
-        if not d.is_dir():
+def _subtree(root_uuid: str, nodes: Dict[str, dict]) -> set:
+    """BFS the user-prompt children of root_uuid; return the inclusive uuid set."""
+    out: set = set()
+    stack = [root_uuid]
+    while stack:
+        u = stack.pop()
+        if u in out or u not in nodes:
             continue
-        jsonls = list(d.glob("*.jsonl"))
-        if not jsonls:
-            continue
+        out.add(u)
+        stack.extend(nodes[u].get("children", []))
+    return out
+
+
+def _dir_real_cwd(project_dir: Path) -> str:
+    """Recover the original `cwd` recorded in any jsonl message — the slug is
+    lossy (slashes and underscores both collapse to '-') so we can't unslug."""
+    try:
+        jsonls = sorted(project_dir.glob("*.jsonl"),
+                        key=lambda x: x.stat().st_mtime, reverse=True)
+    except OSError:
+        return project_dir.name
+    for j in jsonls:
         try:
-            latest_mtime = max(j.stat().st_mtime for j in jsonls)
+            with j.open("r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s.startswith("{"):
+                        continue
+                    try:
+                        data = json.loads(s)
+                    except json.JSONDecodeError:
+                        continue
+                    if data.get("cwd"):
+                        return data["cwd"]
         except OSError:
             continue
-        # Recover the real project path by reading any message's `cwd` field — the
-        # slug rule (slashes + underscores both → '-') is lossy so we can't unslug.
-        real_path = d.name
-        for j in sorted(jsonls, key=lambda x: x.stat().st_mtime, reverse=True):
-            try:
-                with j.open("r", encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        s = line.strip()
-                        if not s.startswith("{"):
-                            continue
-                        try:
-                            data = json.loads(s)
-                        except json.JSONDecodeError:
-                            continue
-                        if data.get("cwd"):
-                            real_path = data["cwd"]
-                            break
-                    if real_path != d.name:
-                        break
-            except OSError:
+    return project_dir.name
+
+
+def _scan_roots(base_path: str, all_projects: bool = False) -> Tuple[List[dict], str]:
+    """Build the list of root conversations the picker will show.
+
+    Each entry: {root_uuid, project_dir, cwd, slug, title, first_seen,
+                 last_active, node_count, native_in_subtree, native_at_root}.
+
+    Returns (roots, scope_note).
+    """
+    base = CLAUDE_PROJECTS_DIR
+    if not base.exists():
+        return [], f"{base} does not exist"
+
+    if all_projects:
+        dirs = [d for d in base.iterdir() if d.is_dir() and list(d.glob("*.jsonl"))]
+        scope = f"all of ~/.claude/projects/ ({len(dirs)} jsonl dirs)"
+    else:
+        target_slug = slug_for(base_path)
+        target_dir = base / target_slug
+        if target_dir.is_dir() and list(target_dir.glob("*.jsonl")):
+            dirs = [target_dir]
+            scope = f"{base_path}"
+        else:
+            return [], f"no Claude Code project at {base_path}"
+
+    roots: List[dict] = []
+    for d in dirs:
+        by_uuid, session_leaf = load_project(d)
+        if not by_uuid:
+            continue
+        nodes, native = build_nodes(by_uuid, session_leaf)
+        real_cwd = _dir_real_cwd(d)
+        for uuid_, n in nodes.items():
+            if n["parent"] is not None:
                 continue
-        projects.append({
-            "slug": d.name,
-            "path": real_path,
-            "sessions": len(jsonls),
-            "mtime": latest_mtime,
-        })
-    projects.sort(key=lambda p: p["mtime"], reverse=True)
-    return projects
+            sub = _subtree(uuid_, nodes)
+            timestamps = [nodes[u]["timestamp"] for u in sub if nodes[u]["timestamp"]]
+            last_ts = max(timestamps, default=n["timestamp"] or "")
+            roots.append({
+                "root_uuid": uuid_,
+                "project_dir": str(d),
+                "cwd": real_cwd,
+                "slug": d.name,
+                "title": n["text"],
+                "first_seen": n["timestamp"] or "",
+                "last_active": last_ts,
+                "node_count": len(sub),
+                "native_in_subtree": sum(1 for u in sub if u in native),
+                "native_at_root": uuid_ in native,
+            })
+
+    roots.sort(key=lambda r: r["last_active"], reverse=True)
+    return roots, scope
 
 
 _PROJECT_PAGE = 12
 
 
-def _project_render(projects: List[dict], selected: int, current_idx: int,
-                    offset: int) -> int:
-    cols = shutil.get_terminal_size((120, 24)).columns
-    visible = projects[offset:offset + _PROJECT_PAGE]
-    num_w = max(2, len(str(len(projects))))
-    label_w = max(20, cols - 38 - num_w)
+def _root_render(roots: List[dict], selected: int, offset: int,
+                 scope_note: str = "", show_dir: bool = False) -> int:
+    cols = shutil.get_terminal_size((140, 24)).columns
+    visible = roots[offset:offset + _PROJECT_PAGE]
+    num_w = max(2, len(str(len(roots))))
+    max_n_w = max((len(str(r["node_count"])) for r in roots), default=1) + 1
+    # fixed prefix width (display cells): "  ▶ NN. ★ MM-DD HH:MM  NNNn  "
+    head_w = 2 + 2 + (num_w + 1) + 1 + 1 + 1 + 11 + 2 + max_n_w + 2
+    dir_w = 18 if show_dir else 0
+    title_w = max(15, cols - head_w - dir_w - 2)
+    scope = _truncate_w(scope_note, cols - 9)  # "  scope: " is 9 cells
     lines = [
-        bold("atr") + dim("  pick a project  ")
-        + dim("(↑/↓ move · Enter select · 1-9 jump · q quit)"),
-        dim(f"  base: {CLAUDE_PROJECTS_DIR}"),
+        bold("atr") + dim(" · pick a conversation root"),
+        dim("    ↑↓ move · ⏎ select · 1-9 jump · a scope · q quit"),
+        dim(f"    scope: {scope}"),
         "",
     ]
-    for i, p in enumerate(visible):
-        absolute_idx = offset + i
-        # Absolute 1-based label — stays attached to the project as you scroll
-        # so the user can always see "this is item 13 of 38". Single-digit
-        # shortcuts still map to the absolute positions 1-9.
-        num_str = f"{absolute_idx + 1:>{num_w}}."
-        marker = green("●") if absolute_idx == current_idx else " "
-        mtime_s = datetime.fromtimestamp(p["mtime"]).strftime("%m-%d %H:%M")
-        sess = f"{p['sessions']:>3} sess"
-        label = p["path"]
-        if len(label) > label_w:
-            label = "…" + label[-(label_w - 1):]
-        if absolute_idx == selected:
+    for i, r in enumerate(visible):
+        abs_idx = offset + i
+        num_str = f"{abs_idx + 1:>{num_w}}."
+        nat = purple("★") if r["native_at_root"] else " "
+        ts = "—"
+        if r["last_active"]:
+            try:
+                ts = datetime.fromisoformat(r["last_active"].replace("Z", "+00:00")).astimezone().strftime("%m-%d %H:%M")
+            except ValueError:
+                ts = r["last_active"][:11]
+        nodes_str = f"{r['node_count']:>{max_n_w - 1}}n"
+        title = _truncate_w(re.sub(r"\s+", " ", r["title"]).strip(), title_w)
+        dir_str = ""
+        if show_dir:
+            short = r["cwd"].rsplit("/", 1)[-1] or r["slug"]
+            short = _truncate_w(short, dir_w)
+            dir_str = dim(short) + " " * max(0, dir_w - _vwidth(short)) + "  "
+        if abs_idx == selected:
             arrow = green("▶")
-            row = (f"  {arrow} {bold(num_str)} {marker} {bold(label):<{label_w}}  "
-                   f"{dim(sess)}  {dim(mtime_s)}")
+            row = (f"  {arrow} {bold(num_str)} {nat} {dim(ts)}  {dim(nodes_str)}  "
+                   f"{dir_str}{bold(title)}")
         else:
-            row = (f"    {dim(num_str)} {marker} {label:<{label_w}}  "
-                   f"{dim(sess)}  {dim(mtime_s)}")
+            row = (f"    {dim(num_str)} {nat} {dim(ts)}  {dim(nodes_str)}  "
+                   f"{dir_str}{title}")
         lines.append(row)
-    if len(projects) > _PROJECT_PAGE:
-        lines.append(dim(f"    … showing {offset + 1}-{offset + len(visible)} of {len(projects)}"))
+    if len(roots) > _PROJECT_PAGE:
+        lines.append(dim(f"    … showing {offset + 1}-{offset + len(visible)} of {len(roots)}"))
     for line in lines:
         print(line)
     return len(lines)
 
 
-def pick_project(default_path: str) -> Optional[str]:
-    """Interactive project picker. Returns selected path or None."""
+def pick_project(default_path: str, all_projects: bool = False) -> Optional[Tuple[str, str]]:
+    """Interactive root-conversation picker.
+
+    Returns (cwd, root_uuid) or None. `cwd` is the path to feed into
+    project_dir_for() and `root_uuid` scopes subsequent commands to that root's
+    subtree."""
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return None
     try:
-        from termios import tcgetattr  # noqa: F401  -- termios import check
+        from termios import tcgetattr  # noqa: F401
     except ImportError:
         return None
-    projects = _scan_projects()
-    if not projects:
+
+    def setup(use_all: bool):
+        roots, note = _scan_roots(default_path, all_projects=use_all)
+        return roots, note
+
+    use_all = all_projects
+    roots, scope_note = setup(use_all)
+    if not roots and not use_all:
+        # No project at cwd — auto-toggle to all so the picker is still useful.
+        use_all = True
+        roots, scope_note = setup(True)
+    if not roots:
         return None
 
-    cwd_slug = slug_for(default_path)
-    current_idx = next((i for i, p in enumerate(projects) if p["slug"] == cwd_slug), -1)
-    selected = current_idx if current_idx >= 0 else 0
-    offset = max(0, min(selected - _PROJECT_PAGE // 2, len(projects) - _PROJECT_PAGE))
+    selected = 0
+    offset = 0
+    show_dir = use_all  # only show project-dir column when listing across dirs
 
-    drawn = _project_render(projects, selected, current_idx, offset)
+    drawn = _root_render(roots, selected, offset, scope_note, show_dir)
     with _RawInput() as raw:
         while True:
             try:
@@ -763,22 +885,34 @@ def pick_project(default_path: str) -> Optional[str]:
 
             old_selected = selected
             if key == "down":
-                selected = (selected + 1) % len(projects)
+                selected = (selected + 1) % len(roots)
             elif key == "up":
-                selected = (selected - 1) % len(projects)
+                selected = (selected - 1) % len(roots)
             elif key == "enter":
                 _menu_clear(drawn)
-                return projects[selected]["path"]
+                r = roots[selected]
+                return (r["cwd"], r["root_uuid"])
             elif key in ("q", "Q", "esc"):
                 _menu_clear(drawn)
                 return None
+            elif key in ("a", "A"):
+                use_all = not use_all
+                roots, scope_note = setup(use_all)
+                if not roots:
+                    use_all = not use_all
+                    roots, scope_note = setup(use_all)
+                show_dir = use_all
+                selected = 0
+                offset = 0
+                _menu_clear(drawn)
+                drawn = _root_render(roots, selected, offset, scope_note, show_dir)
+                continue
             elif key.isdigit() and key != "0":
-                # 1-9 always jump to absolute positions 1-9 (top 9 most recent).
-                # For project #10+, the user navigates with arrow keys.
                 idx = int(key) - 1
-                if 0 <= idx < len(projects):
+                if 0 <= idx < len(roots):
                     _menu_clear(drawn)
-                    return projects[idx]["path"]
+                    r = roots[idx]
+                    return (r["cwd"], r["root_uuid"])
 
             if selected != old_selected:
                 if selected < offset:
@@ -786,7 +920,7 @@ def pick_project(default_path: str) -> Optional[str]:
                 elif selected >= offset + _PROJECT_PAGE:
                     offset = selected - _PROJECT_PAGE + 1
                 _menu_clear(drawn)
-                drawn = _project_render(projects, selected, current_idx, offset)
+                drawn = _root_render(roots, selected, offset, scope_note, show_dir)
 
 
 # ---------- interactive menu (tab navigation) ----------
@@ -902,13 +1036,18 @@ def _read_key_via(raw: Optional[_RawInput] = None) -> str:
         return ri.read_key()
 
 
-def _menu_render(selected: int, project_dir: Path) -> int:
+def _menu_render(selected: int, project_dir: Path, scope_summary: str = "") -> int:
     """Render menu lines (header + options). Returns number of lines drawn."""
+    cols = shutil.get_terminal_size((140, 24)).columns
+    proj_line = _truncate_w(str(project_dir), cols - 13)  # "  project:  " = 12 cells
     lines = [
-        bold("atr") + dim("  pick an action  ") + dim("(↑/↓ move · Enter select · 1-7 jump · q quit)"),
-        dim(f"  project: {project_dir}"),
-        "",
+        bold("atr") + dim(" · pick an action"),
+        dim("    ↑↓ move · ⏎ select · 1-7 jump · q quit"),
+        dim(f"    project: {proj_line}"),
     ]
+    if scope_summary:
+        lines.append(dim(f"    root:    {_truncate_w(scope_summary, cols - 13)}"))
+    lines.append("")
     for i, (_cmd, label, hint, _inp) in enumerate(_MENU, 1):
         if i - 1 == selected:
             arrow = green("▶")
@@ -928,7 +1067,7 @@ def _menu_clear(n: int) -> None:
     sys.stdout.flush()
 
 
-def interactive_menu(path: str) -> Optional[Tuple[str, Optional[str]]]:
+def interactive_menu(path: str, scope_root: Optional[str] = None) -> Optional[Tuple[str, Optional[str]]]:
     """Tab-driven menu. Returns (cmd, input_text_or_None) or None to quit.
     Falls back to None on non-tty environments."""
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
@@ -941,7 +1080,23 @@ def interactive_menu(path: str) -> Optional[Tuple[str, Optional[str]]]:
     except ImportError:
         return None  # non-Unix; caller falls back to default `list`
 
-    drawn = _menu_render(selected, pd)
+    # When the user picked a specific root, summarize it in the header so
+    # they remember what subtree the next action will operate on.
+    scope_summary = ""
+    if scope_root:
+        try:
+            by_uuid, session_leaf = load_project(pd)
+            nodes, _native = build_nodes(by_uuid, session_leaf)
+            if scope_root in nodes:
+                first_line = re.sub(r"\s+", " ", nodes[scope_root]["text"]).strip()
+                if len(first_line) > 60:
+                    first_line = first_line[:59] + "…"
+                size = len(_subtree(scope_root, nodes))
+                scope_summary = f"{scope_root[:8]}  {size}n  {first_line}"
+        except Exception:  # noqa: BLE001 -- header is best-effort
+            scope_summary = scope_root[:8]
+
+    drawn = _menu_render(selected, pd, scope_summary)
     with _RawInput() as raw:
         while True:
             try:
@@ -997,28 +1152,30 @@ def interactive_menu(path: str) -> Optional[Tuple[str, Optional[str]]]:
             if new_sel != selected:
                 selected = new_sel
                 _menu_clear(drawn)
-                drawn = _menu_render(selected, pd)
+                drawn = _menu_render(selected, pd, scope_summary)
 
 
-def _ns_for(cmd: str, value: Optional[str], path: str) -> argparse.Namespace:
+def _ns_for(cmd: str, value: Optional[str], path: str,
+            scope_root: Optional[str] = None) -> argparse.Namespace:
     """Build an argparse Namespace mimicking the chosen subcommand's defaults."""
+    base = {"path": path, "scope_root": scope_root}
     if cmd == "list":
-        return argparse.Namespace(path=path, cmd="list", leaves=False, limit=0,
+        return argparse.Namespace(**base, cmd="list", leaves=False, limit=0,
                                   tree=False, pick=True, exec_=False, func=cmd_browse)
     if cmd == "leaves":
-        return argparse.Namespace(path=path, cmd="leaves", leaves=True, limit=0,
+        return argparse.Namespace(**base, cmd="leaves", leaves=True, limit=0,
                                   tree=False, pick=True, exec_=False, func=cmd_browse)
     if cmd == "tree":
-        return argparse.Namespace(path=path, cmd="tree", match="", func=cmd_tree)
+        return argparse.Namespace(**base, cmd="tree", match="", func=cmd_tree)
     if cmd == "search":
-        return argparse.Namespace(path=path, cmd="search", query=value or "",
+        return argparse.Namespace(**base, cmd="search", query=value or "",
                                   limit=0, tree=False, pick=True, exec_=False,
                                   func=cmd_search)
     if cmd == "resume":
-        return argparse.Namespace(path=path, cmd="resume", uuid=value or "",
+        return argparse.Namespace(**base, cmd="resume", uuid=value or "",
                                   exec_=False, func=cmd_resume)
     if cmd == "info":
-        return argparse.Namespace(path=path, cmd="info", uuid=value or "",
+        return argparse.Namespace(**base, cmd="info", uuid=value or "",
                                   func=cmd_info)
     raise ValueError(f"unknown menu cmd: {cmd}")
 
@@ -1034,29 +1191,29 @@ def main(argv: Optional[List[str]] = None) -> None:
         args.func(args)
         return
 
-    # Interactive flow: first pick a project, then pick an action.
-    if args.path is not None:
-        chosen_path = args.path
-    elif sys.stdin.isatty() and sys.stdout.isatty():
-        picked = pick_project(os.getcwd())
+    # Interactive flow: first pick a root conversation, then pick an action.
+    chosen_path = args.path
+    chosen_root = args.scope_root
+    if chosen_path is None and sys.stdin.isatty() and sys.stdout.isatty():
+        picked = pick_project(os.getcwd(), all_projects=args.all_projects)
         if picked is None:
             return  # user quit
-        chosen_path = picked
-    else:
+        chosen_path, chosen_root = picked
+    elif chosen_path is None:
         chosen_path = os.getcwd()
 
-    choice = interactive_menu(chosen_path) if (sys.stdin.isatty() and sys.stdout.isatty()) else None
+    choice = interactive_menu(chosen_path, chosen_root) if (sys.stdin.isatty() and sys.stdout.isatty()) else None
     if choice is None:
         if not (sys.stdin.isatty() and sys.stdout.isatty()):
-            # Non-tty default: dump the list
             args = argparse.Namespace(
-                path=chosen_path, cmd="list", leaves=False, limit=0, tree=False,
-                pick=False, exec_=False, func=cmd_browse,
+                path=chosen_path, scope_root=chosen_root, cmd="list",
+                leaves=False, limit=0, tree=False, pick=False, exec_=False,
+                func=cmd_browse,
             )
             args.func(args)
         return
     cmd, value = choice
-    args = _ns_for(cmd, value, chosen_path)
+    args = _ns_for(cmd, value, chosen_path, scope_root=chosen_root)
     args.func(args)
 
 
