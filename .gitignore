@@ -8,3 +8,4 @@ instance/
 .env
 .env.local
 .env.*.local
+cli/__pycache__/
