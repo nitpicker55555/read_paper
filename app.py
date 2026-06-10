@@ -308,14 +308,11 @@ def resolve_workspace_file(value: str) -> Path:
         raise ValueError("文件路径不能为空")
 
     workspace_root = WORK_DIR.resolve()
-    upload_root = UPLOAD_DIR.resolve()
     candidate = Path(raw)
     path = candidate.resolve() if candidate.is_absolute() else (workspace_root / raw).resolve()
 
     if not path_is_within(path, workspace_root):
         raise ValueError("文件不在 workspace 内")
-    if path_is_within(path, upload_root):
-        raise ValueError("用户上传目录不在 Workspace 文件区中")
     if not path.exists() or not path.is_file():
         raise FileNotFoundError("文件不存在")
     return path
@@ -340,16 +337,31 @@ def normalize_workspace_refs(values: Iterable[Any]) -> List[Dict[str, Any]]:
 
 def workspace_snapshot() -> Dict[str, Tuple[Path, int, float]]:
     workspace_root = WORK_DIR.resolve()
-    upload_root = UPLOAD_DIR.resolve()
     if not workspace_root.exists():
         return {}
+
+    # Exclude tracked uploads (they have their own attachment chip in the UI), but include
+    # everything else — including codex-created files that happen to land under uploads/.
+    tracked_uploads: set = set()
+    try:
+        with DB_LOCK, db_connection() as conn:
+            for row in conn.execute("SELECT path FROM files").fetchall():
+                try:
+                    tracked_uploads.add(Path(row["path"]).resolve())
+                except (OSError, ValueError):
+                    continue
+    except sqlite3.Error:
+        pass
 
     files: Dict[str, Tuple[Path, int, float]] = {}
     for path in workspace_root.rglob("*"):
         if not path.is_file():
             continue
-        resolved = path.resolve()
-        if path_is_within(resolved, upload_root):
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved in tracked_uploads:
             continue
         try:
             stat = resolved.stat()
@@ -1406,6 +1418,110 @@ def read_claude_code_nodes(cc_dir: Path) -> List[Dict[str, Any]]:
         })
 
     return nodes
+
+
+@app.post("/api/claude-code/resume-from-node")
+def api_claude_code_resume_from_node() -> Response:
+    """Build a synthetic session jsonl that pins the active leaf at the requested message.
+
+    Why: Claude Code's --resume-session-at only matches uuids on the file's current active
+    chain (walked back from the latest last-prompt event). Abandoned sibling branches can't
+    be reached. So we copy just the chain we want into a new session file with a fresh
+    last-prompt pointing at the target — then `claude --resume <new>` lands exactly there.
+    """
+    payload = request.get_json(silent=True) or {}
+    project_path = str(payload.get("path") or "").strip()
+    target_uuid = str(payload.get("message_uuid") or "").strip()
+    if not project_path or not target_uuid:
+        return jsonify({"error": "path 和 message_uuid 都不能为空"}), 400
+    cc_dir = CLAUDE_PROJECTS_DIR / claude_code_slug(project_path)
+    if not cc_dir.exists():
+        return jsonify({"error": f"Claude Code 项目目录不存在：{cc_dir}"}), 404
+
+    # Collect all messages across all sessions for this project, keyed by uuid.
+    # First-occurrence wins, so re-running this against a project that already has synthetic
+    # files (whose entries are byte-for-byte copies of the originals) is idempotent.
+    all_msgs: Dict[str, Tuple[Dict[str, Any], str]] = {}
+    for jsonl_path in sorted(cc_dir.glob("*.jsonl")):
+        try:
+            with jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    raw_line = line.rstrip("\n")
+                    stripped = raw_line.strip()
+                    if not stripped or not stripped.startswith("{"):
+                        continue
+                    try:
+                        d = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                    u = d.get("uuid")
+                    if u and u not in all_msgs:
+                        all_msgs[u] = (d, raw_line)
+        except OSError:
+            continue
+
+    if target_uuid not in all_msgs:
+        return jsonify({"error": f"未在该项目中找到 uuid={target_uuid}"}), 404
+
+    # Walk parentUuid chain from target back to root.
+    chain: List[Tuple[Dict[str, Any], str]] = []
+    cursor: Optional[str] = target_uuid
+    seen: set = set()
+    while cursor and cursor not in seen:
+        seen.add(cursor)
+        entry = all_msgs.get(cursor)
+        if not entry:
+            break
+        chain.append(entry)
+        cursor = entry[0].get("parentUuid")
+    chain.reverse()  # root first, target last
+
+    # Claude Code maps --resume <id> to <id>.jsonl with strict id↔filename match — any
+    # prefix on the filename makes it report "No conversation found". So just use a plain
+    # UUID for the session id and name the file <sid>.jsonl. Synthetic files remain
+    # identifiable by content (single last-prompt event at the very end + no embedded events).
+    new_sid = str(uuid.uuid4())
+    new_path = cc_dir / f"{new_sid}.jsonl"
+
+    # Extract target prompt text for the last-prompt event.
+    target_msg = all_msgs[target_uuid][0]
+    raw_content = (target_msg.get("message") or {}).get("content")
+    target_text = ""
+    if isinstance(raw_content, str):
+        target_text = raw_content
+    elif isinstance(raw_content, list):
+        for block in raw_content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                t = str(block.get("text") or "").strip()
+                if t:
+                    target_text = t
+                    break
+
+    last_prompt_event = json.dumps(
+        {
+            "type": "last-prompt",
+            "lastPrompt": target_text,
+            "leafUuid": target_uuid,
+            "sessionId": new_sid,
+        },
+        ensure_ascii=False,
+    )
+
+    try:
+        with new_path.open("w", encoding="utf-8") as out:
+            for _, raw_line in chain:
+                out.write(raw_line + "\n")
+            out.write(last_prompt_event + "\n")
+    except OSError as exc:
+        return jsonify({"error": f"写入失败：{exc}"}), 500
+
+    return jsonify({
+        "session_id": new_sid,
+        "file": str(new_path),
+        "chain_length": len(chain),
+        "command": f"claude --resume {new_sid}",
+        "target_text_preview": target_text[:80],
+    })
 
 
 @app.get("/api/claude-code/tree")

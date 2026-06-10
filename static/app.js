@@ -1559,31 +1559,48 @@ async function copyTextToClipboard(text) {
 }
 
 function makeResumePill(node) {
-  const sessionId = String(node.codex_session_id || node.own_session_id || "").trim();
   const messageUuid = String(node.resume_message_uuid || "").trim();
-  if (!sessionId || !messageUuid) return null;
+  if (!messageUuid) return null;
   const pill = document.createElement("button");
   pill.type = "button";
   pill.className = "meta-pill resume-pill";
-  const shortId = sessionId.length > 12 ? `${sessionId.slice(0, 8)}…` : sessionId;
-  pill.textContent = `↻ resume @${shortId}`;
-  // Hidden flag --resume-session-at <message-uuid> truncates the session at that exact
-  // message and resumes from it. Works for any user prompt regardless of last-prompt state.
-  const command = `claude --resume ${sessionId} --resume-session-at ${messageUuid}`;
-  pill.title = `点击复制：\n${command}\n\n会精确停在此节点（使用 --resume-session-at 隐藏 flag）`;
+  const shortMsg = messageUuid.slice(0, 8);
+  pill.textContent = `↻ resume @${shortMsg}…`;
+  pill.title = `点击：为此节点生成一个新的 session 文件并复制 resume 命令\n（在 ~/.claude/projects/ 下生成 branch-${shortMsg}-*.jsonl）`;
   pill.addEventListener("click", async (event) => {
     event.stopPropagation();
-    const ok = await copyTextToClipboard(command);
-    if (ok) {
-      const original = pill.textContent;
-      pill.textContent = "已复制 ✓";
-      pill.classList.add("copied");
+    if (pill.disabled) return;
+    pill.disabled = true;
+    const original = pill.textContent;
+    pill.textContent = "生成中…";
+    try {
+      const res = await fetch("/api/claude-code/resume-from-node", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: state.ccPath, message_uuid: messageUuid }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        window.alert(data.error || `生成失败 (HTTP ${res.status})`);
+        return;
+      }
+      const command = data.command || `claude --resume ${data.session_id}`;
+      const ok = await copyTextToClipboard(command);
+      if (ok) {
+        pill.textContent = `已复制 ✓ (链 ${data.chain_length})`;
+        pill.classList.add("copied");
+      } else {
+        window.prompt("自动复制失败，请手动复制：", command);
+        pill.textContent = original;
+      }
+    } catch (err) {
+      window.alert(`生成失败：${err.message || err}`);
+    } finally {
+      pill.disabled = false;
       setTimeout(() => {
         pill.textContent = original;
         pill.classList.remove("copied");
-      }, 1200);
-    } else {
-      window.prompt("自动复制失败，请手动复制：", command);
+      }, 1800);
     }
   });
   return pill;
