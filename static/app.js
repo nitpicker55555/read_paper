@@ -1867,6 +1867,9 @@ function handlePromptDrop(event) {
   // Handle external file drops from OS
   if (event.dataTransfer.files && event.dataTransfer.files.length > 0) {
     event.preventDefault();
+    event.stopPropagation();
+    _dropOverlayCounter = 0;
+    hideDropOverlay();
     uploadDroppedFiles(event.dataTransfer.files);
     return;
   }
@@ -1874,6 +1877,7 @@ function handlePromptDrop(event) {
   const rawRef = event.dataTransfer.getData("application/x-workspace-ref");
   if (!rawRef) return;
   event.preventDefault();
+  event.stopPropagation();
   try {
     const ref = JSON.parse(rawRef);
     if (!ref.path || state.workspaceRefs.some((item) => item.path === ref.path)) return;
