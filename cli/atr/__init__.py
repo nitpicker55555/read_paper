@@ -35,7 +35,11 @@ except ImportError:  # pragma: no cover  -- 3.10 fallback
 
 _CONFIG_DEFAULTS: Dict[str, Any] = {
     "page_size": 15,
-    "paths": {"claude_projects_dir": "~/.claude/projects"},
+    "tool": "claude",                    # which agent CLI to target by default
+    "paths": {
+        "claude_projects_dir": "~/.claude/projects",
+        "codex_sessions_dir": "~/.codex/sessions",
+    },
     "browser": {"default_view": "tree", "tree_order": "oldest_first"},
     "debug": {"log_keys": False},
 }
@@ -397,6 +401,441 @@ def emit_resume(project_dir: Path, node: dict, by_uuid: Dict[str, Tuple[dict, st
         except FileNotFoundError:
             print(red("  ! `claude` not found — install Claude Code CLI and put it on PATH"))
             sys.exit(2)
+
+
+# ---------- codex (~/.codex/sessions/) ----------
+#
+# Codex stores each conversation as one jsonl rollout file under
+# `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<session-id>.jsonl`. The file is a
+# strictly linear event log (no parentUuid threading). Branches across sessions
+# are recorded via `session_meta.payload.forked_from_id`. Codex has no native
+# way to land a `--resume` mid-session — we synthesize a truncated rollout
+# file pinned to a new session id, validated empirically.
+
+CODEX_SESSIONS_DIR = Path(
+    os.environ.get("CODEX_SESSIONS_DIR")
+    or os.path.expanduser(_cfg("paths", "codex_sessions_dir",
+                               default="~/.codex/sessions"))
+).expanduser()
+
+
+def _codex_session_files() -> List[Path]:
+    if not CODEX_SESSIONS_DIR.exists():
+        return []
+    return sorted(CODEX_SESSIONS_DIR.rglob("*.jsonl"))
+
+
+def _codex_read_session_meta(jsonl_path: Path) -> Optional[dict]:
+    """Read the first line of a Codex rollout — `session_meta`. Returns the
+    payload dict (with `id`, `cwd`, `forked_from_id`, `timestamp`, …) or None
+    if the file is malformed."""
+    try:
+        with jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
+            line = f.readline()
+        d = json.loads(line)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if d.get("type") != "session_meta":
+        return None
+    return d.get("payload") or {}
+
+
+def _codex_is_real_user_text(text: str) -> bool:
+    """Codex injects `<environment_context>` and `<turn_aborted>` blocks as
+    role=user messages. Filter them out — we only want messages the human typed."""
+    if not text:
+        return False
+    t = text.strip()
+    if t.startswith("<environment_context>"):
+        return False
+    if t.startswith("<turn_aborted>"):
+        return False
+    return True
+
+
+def _codex_extract_text(payload: dict) -> str:
+    """Concatenate text from a response_item.payload's content blocks."""
+    parts: List[str] = []
+    for c in (payload.get("content") or []):
+        if not isinstance(c, dict):
+            continue
+        t = c.get("text") or c.get("input_text") or c.get("output_text") or ""
+        if t:
+            parts.append(t)
+    return "\n".join(parts).strip()
+
+
+def _codex_parse_session_prompts(jsonl_path: Path) -> List[dict]:
+    """Walk a Codex rollout; return one entry per real user prompt with the
+    line offset, text, and timestamp. The line offset is what truncation needs."""
+    prompts: List[dict] = []
+    try:
+        with jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if d.get("type") != "response_item":
+                    continue
+                p = d.get("payload") or {}
+                if p.get("type") != "message" or p.get("role") != "user":
+                    continue
+                text = _codex_extract_text(p)
+                if not _codex_is_real_user_text(text):
+                    continue
+                prompts.append({
+                    "line": i,
+                    "text": text,
+                    "timestamp": d.get("timestamp") or "",
+                })
+    except OSError:
+        return []
+    return prompts
+
+
+def _codex_collect_assistant_text(jsonl_path: Path, user_lines: List[int]) -> Dict[int, str]:
+    """For every user prompt line, gather the assistant text that follows it
+    (until the next user prompt). Used so the browser's "search in replies"
+    mode works for Codex too."""
+    if not user_lines:
+        return {}
+    out: Dict[int, List[str]] = {ln: [] for ln in user_lines}
+    user_lines_sorted = sorted(user_lines)
+    try:
+        with jsonl_path.open("r", encoding="utf-8", errors="replace") as f:
+            current_owner: Optional[int] = None
+            owner_idx = -1
+            for i, line in enumerate(f):
+                if owner_idx + 1 < len(user_lines_sorted) and i == user_lines_sorted[owner_idx + 1]:
+                    owner_idx += 1
+                    current_owner = user_lines_sorted[owner_idx]
+                    continue
+                if current_owner is None:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if d.get("type") != "response_item":
+                    continue
+                p = d.get("payload") or {}
+                if p.get("type") != "message" or p.get("role") != "assistant":
+                    continue
+                txt = _codex_extract_text(p)
+                if txt:
+                    out[current_owner].append(txt)
+    except OSError:
+        return {ln: "" for ln in user_lines}
+    return {ln: "\n".join(parts) for ln, parts in out.items()}
+
+
+def _codex_load_sessions(cwd_filter: Optional[str], all_projects: bool = False) -> Dict[str, dict]:
+    """Scan all Codex rollouts; return a dict keyed by session_id with metadata,
+    prompts list (with line offsets), and the source file path. When
+    cwd_filter is set, restrict to sessions whose session_meta cwd matches the
+    filter (descendant match) unless all_projects is True."""
+    sessions: Dict[str, dict] = {}
+    try:
+        cwd_resolved = Path(cwd_filter).resolve() if cwd_filter else None
+    except OSError:
+        cwd_resolved = None
+    for path in _codex_session_files():
+        meta = _codex_read_session_meta(path)
+        if not meta or not meta.get("id"):
+            continue
+        sess_cwd = meta.get("cwd") or ""
+        if cwd_resolved and not all_projects:
+            try:
+                sp = Path(sess_cwd).resolve() if sess_cwd else None
+            except OSError:
+                sp = None
+            if sp is None:
+                continue
+            if sp != cwd_resolved:
+                try:
+                    sp.relative_to(cwd_resolved)
+                except ValueError:
+                    continue
+        prompts = _codex_parse_session_prompts(path)
+        sessions[meta["id"]] = {
+            "session_id": meta["id"],
+            "session_file": str(path),
+            "cwd": sess_cwd,
+            "timestamp": meta.get("timestamp") or "",
+            "forked_from_id": meta.get("forked_from_id"),
+            "thread_source": meta.get("thread_source"),
+            "originator": meta.get("originator"),
+            "model_provider": meta.get("model_provider"),
+            "cli_version": meta.get("cli_version"),
+            "prompts": prompts,
+            # Filled lazily by build_nodes when search-in-replies is on.
+            "_answers": None,
+        }
+    return sessions
+
+
+def _codex_build_nodes(sessions: Dict[str, dict]) -> Tuple[Dict[str, dict], set]:
+    """Map Codex's session/prompt schema onto atr's node graph.
+
+    Each user prompt becomes a node with uuid `<session_id>:<index>`. Within a
+    session, prompts chain linearly (parent = previous prompt). When a session
+    has `forked_from_id` pointing at another session we have nodes for, the
+    forked session's first prompt's parent is approximated to the parent
+    session's LAST prompt (Codex doesn't record the exact fork message).
+
+    native_reachable = the last prompt of each session — that's where stock
+    `codex resume <sid>` actually lands."""
+    nodes: Dict[str, dict] = {}
+    native_reachable: set = set()
+    for sid, sess in sessions.items():
+        prompts = sess["prompts"]
+        if not prompts:
+            continue
+        # Lazily compute assistant text once per session (for "search in replies").
+        if sess.get("_answers") is None:
+            sess["_answers"] = _codex_collect_assistant_text(
+                Path(sess["session_file"]), [p["line"] for p in prompts]
+            )
+        for idx, prompt in enumerate(prompts):
+            node_id = f"{sid}:{idx}"
+            if idx == 0:
+                parent_id = None
+                fpid = sess.get("forked_from_id")
+                if fpid and fpid in sessions and sessions[fpid]["prompts"]:
+                    parent_id = f"{fpid}:{len(sessions[fpid]['prompts']) - 1}"
+            else:
+                parent_id = f"{sid}:{idx - 1}"
+            nodes[node_id] = {
+                "uuid": node_id,
+                "parent": parent_id,
+                "children": [],
+                "text": prompt["text"],
+                "timestamp": prompt["timestamp"] or "",
+                "session_id": sid,
+                "cwd": sess.get("cwd") or "",
+                "native_session_id": None,
+                "answer_text": sess["_answers"].get(prompt["line"], ""),
+                # Driver-specific extras so `synthesize` can find the source file.
+                "_codex_session_file": sess["session_file"],
+                "_codex_prompt_line": prompt["line"],
+                "_codex_prompt_index": idx,
+                "_codex_total_prompts": len(prompts),
+            }
+            if idx == len(prompts) - 1:
+                native_reachable.add(node_id)
+                nodes[node_id]["native_session_id"] = sid
+    for nid, n in nodes.items():
+        pid = n["parent"]
+        if pid and pid in nodes:
+            nodes[pid]["children"].append(nid)
+    return nodes, native_reachable
+
+
+def _codex_write_synthetic(target: dict) -> Tuple[str, int, Path]:
+    """Write a new rollout file truncated so its 'last user message' is the
+    chosen node. Returns (new_sid, chain_length, new_path). The synthetic file
+    is placed in `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<new-sid>.jsonl`
+    so codex's by-id lookup finds it."""
+    src = Path(target["_codex_session_file"])
+    src_lines = src.read_text(encoding="utf-8", errors="replace").splitlines()
+    target_line = target["_codex_prompt_line"]
+    # Find the NEXT real user prompt after target_line — cut just before it so
+    # we keep the target prompt + the assistant's reply to it. If there's no
+    # later user prompt, copy the whole file.
+    cut: Optional[int] = None
+    for i in range(target_line + 1, len(src_lines)):
+        try:
+            d = json.loads(src_lines[i])
+        except json.JSONDecodeError:
+            continue
+        if d.get("type") != "response_item":
+            continue
+        p = d.get("payload") or {}
+        if p.get("type") != "message" or p.get("role") != "user":
+            continue
+        if _codex_is_real_user_text(_codex_extract_text(p)):
+            cut = i
+            break
+    chain = src_lines[:cut] if cut is not None else src_lines[:]
+    if not chain:
+        raise RuntimeError("synthetic rollout would be empty")
+    # Rewrite the session_meta header with a fresh id + timestamp; drop any
+    # forked_from_id so codex treats the new file as an independent session.
+    try:
+        meta = json.loads(chain[0])
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"could not parse source session_meta: {exc}")
+    new_sid = str(uuid.uuid4())
+    payload = meta.get("payload") or {}
+    payload["id"] = new_sid
+    payload.pop("forked_from_id", None)
+    now = datetime.now(timezone.utc)
+    payload["timestamp"] = now.isoformat().replace("+00:00", "Z")
+    meta["payload"] = payload
+    meta["timestamp"] = payload["timestamp"]
+    chain[0] = json.dumps(meta, ensure_ascii=False)
+    out_dir = CODEX_SESSIONS_DIR / now.strftime("%Y") / now.strftime("%m") / now.strftime("%d")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    new_path = out_dir / f"rollout-{now.strftime('%Y-%m-%dT%H-%M-%S')}-{new_sid}.jsonl"
+    new_path.write_text("\n".join(chain) + "\n", encoding="utf-8")
+    return new_sid, len(chain), new_path
+
+
+def _codex_emit_resume(node: dict, exec_after: bool) -> None:
+    native_sid = node.get("native_session_id") if isinstance(node, dict) else None
+    if native_sid:
+        cmd_str = f"codex resume {native_sid}"
+        print()
+        print(green(f"  ✓ native resume target — using original session, no file written"))
+        print(bold(f"  $ {cmd_str}"))
+        print()
+        if exec_after:
+            print(dim("  → exec…"))
+            try:
+                os.execvp("codex", ["codex", "resume", native_sid])
+            except FileNotFoundError:
+                print(red("  ! `codex` not found — install OpenAI Codex CLI and put it on PATH"))
+                sys.exit(2)
+        return
+
+    new_sid, chain_len, new_path = _codex_write_synthetic(node)
+    cmd_str = f"codex resume {new_sid}"
+    print()
+    print(green(f"  ✓ synthesized rollout ({chain_len}-line chain) → {new_path.name}"))
+    print(bold(f"  $ {cmd_str}"))
+    print()
+    if exec_after:
+        print(dim("  → exec…"))
+        try:
+            os.execvp("codex", ["codex", "resume", new_sid])
+        except FileNotFoundError:
+            print(red("  ! `codex` not found — install OpenAI Codex CLI and put it on PATH"))
+            sys.exit(2)
+
+
+# ---------- driver dispatch ----------
+
+class ClaudeDriver:
+    """Wraps the Claude-Code data model so command code can stay tool-agnostic."""
+    name = "claude"
+    resume_verb = "claude --resume"
+
+    def display_project(self, cwd: str) -> Path:
+        return project_dir_for(cwd)
+
+    def gather(self, cwd: str, scope_root: Optional[str]
+               ) -> Tuple[Path, Dict[str, dict], set, Any]:
+        pd = project_dir_for(cwd)
+        if not pd.exists():
+            print(red(f"Claude Code project directory not found: {pd}"), file=sys.stderr)
+            print(dim(f"  (slug = {slug_for(cwd)})"), file=sys.stderr)
+            sys.exit(2)
+        by_uuid, session_leaf = load_project(pd)
+        nodes, native = build_nodes(by_uuid, session_leaf)
+        if scope_root:
+            matches = [u for u in nodes if u.startswith(scope_root)]
+            if not matches:
+                print(red(f"scope root uuid {scope_root!r} not found in this project"), file=sys.stderr)
+                sys.exit(2)
+            if len(matches) > 1:
+                print(red(f"scope root prefix {scope_root!r} is ambiguous"), file=sys.stderr)
+                sys.exit(2)
+            keep = _subtree(matches[0], nodes)
+            nodes = {u: nodes[u] for u in keep}
+            native = native & keep
+        # Raw bag for `emit_resume`'s synthesis step.
+        return pd, nodes, native, by_uuid
+
+    def emit_resume(self, project_dir: Path, node: dict, raw: Any, exec_after: bool) -> None:
+        emit_resume(project_dir, node, raw, exec_after)
+
+    def scan_roots(self, cwd: str, all_projects: bool) -> Tuple[List[dict], str]:
+        return _scan_roots(cwd, all_projects=all_projects)
+
+
+class CodexDriver:
+    name = "codex"
+    resume_verb = "codex resume"
+
+    def display_project(self, cwd: str) -> Path:
+        # Codex doesn't have a per-cwd directory — show the actual cwd.
+        return Path(cwd)
+
+    def gather(self, cwd: str, scope_root: Optional[str]
+               ) -> Tuple[Path, Dict[str, dict], set, Any]:
+        sessions = _codex_load_sessions(cwd)
+        if not sessions:
+            print(red(f"no Codex sessions found under cwd {cwd!r}"), file=sys.stderr)
+            print(dim(f"  scanned {CODEX_SESSIONS_DIR}"), file=sys.stderr)
+            sys.exit(2)
+        nodes, native = _codex_build_nodes(sessions)
+        if scope_root:
+            matches = [u for u in nodes if u.startswith(scope_root)]
+            if not matches:
+                print(red(f"scope root {scope_root!r} not found"), file=sys.stderr)
+                sys.exit(2)
+            if len(matches) > 1:
+                print(red(f"scope root prefix {scope_root!r} is ambiguous"), file=sys.stderr)
+                sys.exit(2)
+            keep = _subtree(matches[0], nodes)
+            nodes = {u: nodes[u] for u in keep}
+            native = native & keep
+        return Path(cwd), nodes, native, sessions
+
+    def emit_resume(self, project_dir: Path, node: dict, raw: Any, exec_after: bool) -> None:
+        _codex_emit_resume(node, exec_after)
+
+    def scan_roots(self, cwd: str, all_projects: bool) -> Tuple[List[dict], str]:
+        sessions = _codex_load_sessions(cwd, all_projects=all_projects)
+        nodes, native = _codex_build_nodes(sessions)
+        roots: List[dict] = []
+        for sid, sess in sessions.items():
+            prompts = sess["prompts"]
+            if not prompts:
+                continue
+            first_id = f"{sid}:0"
+            last_id = f"{sid}:{len(prompts) - 1}"
+            # We treat a session as a "root" for picker purposes if its first
+            # prompt has no parent in the node graph (independent or its fork
+            # parent fell out of scope). Forked sessions whose parent is in
+            # scope show up as children inside the tree view, not in the
+            # picker.
+            if first_id not in nodes:
+                continue
+            parent = nodes[first_id].get("parent")
+            if parent and parent in nodes:
+                continue
+            sub = _subtree(first_id, nodes)
+            roots.append({
+                "root_uuid": first_id,
+                "project_dir": sess["session_file"],
+                "cwd": sess["cwd"],
+                "slug": sid,
+                "title": nodes[last_id]["text"],
+                "root_text": nodes[first_id]["text"],
+                "latest_uuid": last_id,
+                "first_seen": prompts[0]["timestamp"],
+                "last_active": prompts[-1]["timestamp"],
+                "node_count": len(sub),
+                "native_in_subtree": sum(1 for u in sub if u in native),
+                "native_at_root": first_id in native,
+            })
+        roots.sort(key=lambda r: r["last_active"], reverse=True)
+        scope = (f"all of {CODEX_SESSIONS_DIR} ({len(sessions)} sessions)"
+                 if all_projects else cwd)
+        if not roots and not all_projects:
+            scope = f"no Codex session at {cwd}"
+        return roots, scope
+
+
+_DRIVERS = {"claude": ClaudeDriver(), "codex": CodexDriver()}
+
+
+def _get_driver(name: str):
+    if name not in _DRIVERS:
+        raise ValueError(f"unknown tool: {name!r}; choose one of {sorted(_DRIVERS)}")
+    return _DRIVERS[name]
 
 
 # ---------- listing / display ----------
@@ -911,29 +1350,20 @@ def _print_summary(project_dir: Path, total: int, native: int, leaves: int) -> N
     )
 
 
-def _gather(path: str, scope_root: Optional[str] = None
-            ) -> Tuple[Path, Dict[str, dict], set, Dict[str, Tuple[dict, str]]]:
-    pd = project_dir_for(path)
-    if not pd.exists():
-        print(red(f"Claude Code project directory not found: {pd}"), file=sys.stderr)
-        print(dim(f"  (slug = {slug_for(path)})"), file=sys.stderr)
-        sys.exit(2)
-    by_uuid, session_leaf = load_project(pd)
-    nodes, native = build_nodes(by_uuid, session_leaf)
-    if scope_root:
-        # Allow uuid prefix match for the CLI -r flag.
-        matches = [u for u in nodes if u.startswith(scope_root)]
-        if not matches:
-            print(red(f"scope root uuid {scope_root!r} not found in this project"),
-                  file=sys.stderr)
-            sys.exit(2)
-        if len(matches) > 1:
-            print(red(f"scope root prefix {scope_root!r} is ambiguous"), file=sys.stderr)
-            sys.exit(2)
-        keep = _subtree(matches[0], nodes)
-        nodes = {u: nodes[u] for u in keep}
-        native = native & keep
-    return pd, nodes, native, by_uuid
+def _driver_for(args) -> Any:
+    """Resolve which driver this invocation uses. Precedence:
+    CLI flag (`--codex`/`--claude`/`--tool`) > config file > built-in default."""
+    name = getattr(args, "tool", None) or _cfg("tool", default="claude")
+    return _get_driver(name)
+
+
+def _gather(args, path: str, scope_root: Optional[str] = None
+            ) -> Tuple[Path, Dict[str, dict], set, Any]:
+    """Driver-aware loader. The returned `raw` is whatever the driver's
+    `gather` returns as its fourth element (by_uuid for Claude, sessions for
+    Codex) — only `emit_resume` uses it."""
+    driver = _driver_for(args)
+    return driver.gather(path, scope_root)
 
 
 def _show_items(args, items: List[dict], nodes: Dict[str, dict], native: set,
@@ -976,7 +1406,7 @@ def _show_items(args, items: List[dict], nodes: Dict[str, dict], native: set,
 def cmd_browse(args):
     """CLI dump for `atr list` / `atr leaves`. Pure print, no interactive
     picker — the picker is reached via bare `atr` which opens browse_project."""
-    pd, nodes, native, _by_uuid = _gather(args.path, getattr(args, "scope_root", None))
+    pd, nodes, native, _raw = _gather(args, args.path, getattr(args, "scope_root", None))
     items = list(nodes.values())
     if args.leaves:
         items = [n for n in items if not n["children"]]
@@ -993,7 +1423,7 @@ def cmd_browse(args):
 
 
 def cmd_search(args):
-    pd, nodes, native, _by_uuid = _gather(args.path, getattr(args, "scope_root", None))
+    pd, nodes, native, _raw = _gather(args, args.path, getattr(args, "scope_root", None))
     q = args.query.lower()
     matches = [n for n in nodes.values() if q in n["text"].lower()]
     matches.sort(key=lambda n: n["timestamp"], reverse=True)
@@ -1010,7 +1440,7 @@ def cmd_search(args):
 
 def cmd_tree(args) -> None:
     """Dedicated tree-view command. Always tree, never pick."""
-    pd, nodes, native, _by_uuid = _gather(args.path, getattr(args, "scope_root", None))
+    pd, nodes, native, _raw = _gather(args, args.path, getattr(args, "scope_root", None))
 
     if getattr(args, "json", False):
         _emit_tree_json(pd, nodes, native)
@@ -1034,43 +1464,54 @@ def cmd_tree(args) -> None:
 
 
 def cmd_resume(args) -> None:
-    pd, nodes, _native, by_uuid = _gather(args.path, getattr(args, "scope_root", None))
-    matches = [u for u in by_uuid if u.startswith(args.uuid)]
-    if not matches:
+    driver = _driver_for(args)
+    pd, nodes, _native, raw = _gather(args, args.path, getattr(args, "scope_root", None))
+
+    if isinstance(driver, ClaudeDriver):
+        # Claude: prefix-match against the raw event bag so non-user-prompt
+        # uuids still resolve (with a warning) for backwards compatibility.
+        by_uuid = raw
+        candidates = [u for u in by_uuid if u.startswith(args.uuid)]
+    else:
+        candidates = [u for u in nodes if u.startswith(args.uuid)]
+
+    if not candidates:
         _fail(f"no uuid starts with {args.uuid!r}", args)
-    if len(matches) > 1:
+    if len(candidates) > 1:
         if getattr(args, "json", False):
             _emit_json({
                 "error": "ambiguous_prefix",
                 "prefix": args.uuid,
-                "matches": [
-                    {
-                        "uuid": m,
-                        "text": _user_text((by_uuid[m][0].get("message") or {}).get("content"))[:80],
-                    }
-                    for m in matches[:20]
-                ],
+                "matches": [{"uuid": m, "text": (nodes.get(m, {}).get("text") or "")[:80]}
+                            for m in candidates[:20]],
             })
             sys.exit(2)
-        print(red(f"prefix {args.uuid!r} is ambiguous ({len(matches)} matches):"), file=sys.stderr)
-        for m in matches[:6]:
-            text = _user_text((by_uuid[m][0].get("message") or {}).get("content"))[:60]
+        print(red(f"prefix {args.uuid!r} is ambiguous ({len(candidates)} matches):"), file=sys.stderr)
+        for m in candidates[:6]:
+            text = (nodes.get(m, {}).get("text") or "")[:60]
             print(f"  {m}  {dim(text)}", file=sys.stderr)
         sys.exit(2)
-    target = matches[0]
+
+    target = candidates[0]
     node = nodes.get(target)
     if node is None:
-        text = _user_text((by_uuid[target][0].get("message") or {}).get("content"))[:80]
-        node = {"uuid": target, "text": text}
-        if not getattr(args, "json", False):
-            print(yellow(f"⚠ {target[:8]} is not a user prompt ({by_uuid[target][0].get('type')}) — trying anyway"), file=sys.stderr)
+        if isinstance(driver, ClaudeDriver):
+            text = _user_text((raw[target][0].get("message") or {}).get("content"))[:80]
+            node = {"uuid": target, "text": text}
+            if not getattr(args, "json", False):
+                print(yellow(f"⚠ {target[:8]} is not a user prompt ({raw[target][0].get('type')}) — trying anyway"), file=sys.stderr)
+        else:
+            _fail(f"node {target!r} is not a resumable Codex prompt", args)
 
-    # Native shortcut: stock --resume already lands here, skip synthesis.
-    native_sid = node.get("native_session_id") if isinstance(node, dict) else None
-    if native_sid:
-        cmd_str = f"claude --resume {native_sid}"
-        if getattr(args, "json", False):
+    if getattr(args, "json", False):
+        # JSON mode mirrors the human path: native shortcut OR synthesize. We
+        # call the driver's pure helpers directly so we can capture the
+        # session id / file path without calling exec.
+        native_sid = node.get("native_session_id") if isinstance(node, dict) else None
+        if native_sid:
+            cmd_str = f"{driver.resume_verb} {native_sid}"
             _emit_json({
+                "tool": driver.name,
                 "target_uuid": target,
                 "target_text": node.get("text", ""),
                 "session_id": native_sid,
@@ -1078,25 +1519,14 @@ def cmd_resume(args) -> None:
                 "synthesized": False,
                 "command": cmd_str,
             })
+            return
+        if isinstance(driver, ClaudeDriver):
+            new_sid, chain_len, new_path = write_synthetic_session(pd, target, raw)
         else:
-            print()
-            print(green(f"  ✓ native resume target — using original session, no file written"))
-            print(bold(f"  $ {cmd_str}"))
-            print()
-        if args.exec_:
-            if not getattr(args, "json", False):
-                print(dim("  → exec…"))
-            try:
-                os.execvp("claude", ["claude", "--resume", native_sid])
-            except FileNotFoundError:
-                print(red("  ! `claude` not found — install Claude Code CLI and put it on PATH"))
-                sys.exit(2)
-        return
-
-    new_sid, chain_len, new_path = write_synthetic_session(pd, target, by_uuid)
-    cmd_str = f"claude --resume {new_sid}"
-    if getattr(args, "json", False):
+            new_sid, chain_len, new_path = _codex_write_synthetic(node)
+        cmd_str = f"{driver.resume_verb} {new_sid}"
         _emit_json({
+            "tool": driver.name,
             "target_uuid": target,
             "target_text": node.get("text", ""),
             "session_id": new_sid,
@@ -1105,23 +1535,13 @@ def cmd_resume(args) -> None:
             "chain_length": chain_len,
             "command": cmd_str,
         })
-    else:
-        print()
-        print(green(f"  ✓ synthesized session ({chain_len}-link chain) → {new_path.name}"))
-        print(bold(f"  $ {cmd_str}"))
-        print()
-    if args.exec_:
-        if not getattr(args, "json", False):
-            print(dim("  → exec…"))
-        try:
-            os.execvp("claude", ["claude", "--resume", new_sid])
-        except FileNotFoundError:
-            print(red("  ! `claude` not found — install Claude Code CLI and put it on PATH"))
-            sys.exit(2)
+        return
+
+    driver.emit_resume(pd, node, raw, exec_after=bool(getattr(args, "exec_", False)))
 
 
 def cmd_info(args) -> None:
-    pd, nodes, native, by_uuid = _gather(args.path, getattr(args, "scope_root", None))
+    pd, nodes, native, _raw = _gather(args, args.path, getattr(args, "scope_root", None))
     matches = [u for u in nodes if u.startswith(args.uuid)]
     if not matches:
         _fail(f"no uuid starts with {args.uuid!r}", args)
@@ -1151,9 +1571,10 @@ def cmd_info(args) -> None:
 def cmd_roots(args) -> None:
     """List the root conversations under a project path. Designed for agents:
     pair with `--json` to get a machine-readable inventory; pair with
-    `--all` to scan every jsonl dir under ~/.claude/projects/."""
-    roots, scope = _scan_roots(args.path or os.getcwd(),
-                               all_projects=getattr(args, "all_projects", False))
+    `--all` to scan every project dir."""
+    driver = _driver_for(args)
+    roots, scope = driver.scan_roots(args.path or os.getcwd(),
+                                     all_projects=getattr(args, "all_projects", False))
     if getattr(args, "json", False):
         _emit_json({
             "scope": scope,
@@ -1297,8 +1718,15 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("-r", "--root", default=None, dest="scope_root",
                     help="scope to a specific root conversation (uuid prefix)")
     ap.add_argument("-a", "--all", action="store_true", dest="all_projects",
-                    help="include roots from every ~/.claude/projects/ dir, "
+                    help="include roots from every project dir, "
                          "not just the one matching cwd")
+    tool_group = ap.add_mutually_exclusive_group()
+    tool_group.add_argument("--tool", default=None, choices=sorted(_DRIVERS),
+                            help="which agent CLI to target (default from config)")
+    tool_group.add_argument("--claude", dest="tool", action="store_const",
+                            const="claude", help="shortcut for --tool claude")
+    tool_group.add_argument("--codex", dest="tool", action="store_const",
+                            const="codex", help="shortcut for --tool codex")
     sub = ap.add_subparsers(dest="cmd")
 
     p_list = sub.add_parser("list", aliases=["ls"], help="dump every node in a table (newest first)")
@@ -1501,12 +1929,13 @@ def _root_render(roots: List[dict], selected: int, offset: int,
     return len(lines)
 
 
-def pick_project(default_path: str, all_projects: bool = False) -> Optional[Tuple[str, str]]:
+def pick_project(default_path: str, all_projects: bool = False,
+                 driver: Any = None) -> Optional[Tuple[str, str]]:
     """Interactive root-conversation picker.
 
-    Returns (cwd, root_uuid) or None. `cwd` is the path to feed into
-    project_dir_for() and `root_uuid` scopes subsequent commands to that root's
-    subtree."""
+    Returns (cwd, root_uuid) or None. `cwd` is the path to feed into the
+    driver's gather() and `root_uuid` scopes subsequent commands to that
+    root's subtree."""
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return None
     try:
@@ -1514,8 +1943,10 @@ def pick_project(default_path: str, all_projects: bool = False) -> Optional[Tupl
     except ImportError:
         return None
 
+    drv = driver or _get_driver(_cfg("tool", default="claude"))
+
     def setup(use_all: bool):
-        roots, note = _scan_roots(default_path, all_projects=use_all)
+        roots, note = drv.scan_roots(default_path, all_projects=use_all)
         return roots, note
 
     use_all = all_projects
@@ -1699,6 +2130,7 @@ def _menu_clear(n: int) -> None:
 def main(argv: Optional[List[str]] = None) -> None:
     ap = build_parser()
     args = ap.parse_args(argv)
+    driver = _driver_for(args)
 
     if args.cmd:
         # Explicit subcommand — keep cwd as the default project unless -p was given.
@@ -1713,6 +2145,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         chosen_root = args.scope_root
         ns = argparse.Namespace(
             path=chosen_path, scope_root=chosen_root, cmd="list",
+            tool=args.tool,
             leaves=False, limit=0, tree=False, json=False, func=cmd_browse,
         )
         ns.func(ns)
@@ -1729,23 +2162,18 @@ def main(argv: Optional[List[str]] = None) -> None:
             if chosen_path is not None:
                 layer = "browse"
                 continue
-            picked = pick_project(os.getcwd(), all_projects=args.all_projects)
+            picked = pick_project(os.getcwd(),
+                                  all_projects=args.all_projects,
+                                  driver=driver)
             if picked is None:
                 return  # quit
             chosen_path, chosen_root = picked
             layer = "browse"
         elif layer == "browse":
-            pd = project_dir_for(chosen_path)
-            if not pd.exists():
-                print(red(f"Claude Code project directory not found: {pd}"),
-                      file=sys.stderr)
+            try:
+                pd, nodes, native, raw = driver.gather(chosen_path, chosen_root)
+            except SystemExit:
                 return
-            by_uuid, session_leaf = load_project(pd)
-            nodes, native = build_nodes(by_uuid, session_leaf)
-            if chosen_root:
-                keep = _subtree(chosen_root, nodes)
-                nodes = {u: nodes[u] for u in keep}
-                native = native & keep
             scope_summary = chosen_path
             if chosen_root:
                 root_node = nodes.get(chosen_root)
@@ -1762,8 +2190,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                 chosen_root = None
                 layer = "project"
                 continue
-            # result is a node dict — resume it
-            emit_resume(pd, result, by_uuid, exec_after=False)
+            # result is a node dict — resume it via the driver
+            driver.emit_resume(pd, result, raw, exec_after=False)
             return
 
 

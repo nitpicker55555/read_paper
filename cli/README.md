@@ -1,14 +1,19 @@
 # atr — agent tree resume
 
-Stdlib-only Python CLI to browse and resume any node in your local Claude Code
-conversation tree — **including abandoned sibling branches** that
-`claude --resume <session-id>` can't reach natively.
+Stdlib-only Python CLI to browse and resume any node in your local agent
+conversation tree — **including abandoned sibling branches** that stock
+`--resume` can't reach natively. Supports two backends:
 
-The trick: when you pick a node, `atr` writes a fresh
-`~/.claude/projects/<slug>/<new-sid>.jsonl` whose content is just the parent
-chain from your target back to the root, capped by a synthesized
-`last-prompt` event pinning the active leaf at your target. Claude Code
-loads that file and lands exactly there.
+- **Claude Code** (default): `~/.claude/projects/<slug>/<sid>.jsonl` files.
+  Tree across branches in one slug. Resume any historical node.
+- **OpenAI Codex CLI** (`--codex`): `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`
+  rollouts, stitched into a session tree via each session's `forked_from_id`.
+  Resume any message-level prompt, even mid-session, even on abandoned branches.
+
+The trick: when you pick a node, `atr` writes a fresh rollout file whose
+content is just the parent chain from your target up to the root, with the
+header rewritten to a brand-new session id. The agent CLI loads that file via
+its native `--resume` and lands exactly at your target.
 
 ## Install
 
@@ -84,8 +89,12 @@ across every project dir (handy when cd is in a directory with no project
 of its own). Pass `atr -a` to start in that mode.
 
 ```bash
-# interactive: pick root conversation → pick action
+# interactive: pick root conversation → pick action (Claude by default)
 atr
+
+# same, but browse your Codex CLI sessions
+atr --codex
+atr --tool codex roots --json
 
 # skip both pickers and operate on the whole jsonl dir at cwd
 atr -p .
@@ -219,4 +228,23 @@ Code reports "No conversation found".
 - The slug for a path uses Claude Code's own rule: replace `/` and `_` with
   `-`. e.g. `/Users/puzhen/PycharmProjects/read_paper`
   → `-Users-puzhen-PycharmProjects-read-paper`.
-- Override the project root with `CLAUDE_PROJECTS_DIR=/some/other/dir atr`.
+- Override the project root with `CLAUDE_PROJECTS_DIR=/some/other/dir atr`
+  (or `CODEX_SESSIONS_DIR=/path/to/dir atr --codex`).
+
+## Codex notes
+
+- Codex has no native concept of sibling branches — every session is a linear
+  rollout, and forks are recorded only via each new session's
+  `forked_from_id`. `atr` stitches them into a tree: each user prompt is a
+  node, prompts within one session chain linearly, and a session's first
+  prompt is grafted onto the last prompt of its parent session.
+- Node IDs are `<codex-session-id>:<prompt-index>` (0-based). A prefix that
+  uniquely identifies a session also uniquely identifies its nodes — but if
+  multiple prompts in the same session match a prefix, you'll need to add
+  `:N` to disambiguate.
+- Native shortcut for Codex: when you pick the **last** prompt of a session,
+  `atr` emits `codex resume <original-sid>` instead of synthesizing a new
+  file — that's where stock `codex resume` already lands.
+- Each synthesized rollout is placed under
+  `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<new-sid>.jsonl`. Codex finds
+  it by walking the date dirs for the matching session id.

@@ -6,11 +6,18 @@
 # Rows shown per page in any paginated view (project picker, node list, tree).
 page_size = 15
 
+# Which agent CLI to drive by default. One of: "claude" | "codex".
+# Override per-invocation with `atr --claude` / `atr --codex` / `atr --tool codex`.
+tool = "claude"
+
 
 [paths]
 
 # Where Claude Code stores its conversation jsonl files.
 claude_projects_dir = "~/.claude/projects"
+
+# Where OpenAI Codex CLI stores its session rollouts (organized by YYYY/MM/DD).
+codex_sessions_dir = "~/.codex/sessions"
 
 
 [browser]
