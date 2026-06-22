@@ -1,13 +1,13 @@
-"""agent tree resume — browse and resume any node in your local Claude Code
-conversation tree, including abandoned sibling branches that `claude --resume`
-can't reach natively.
+"""treeflow — browse and resume any node in your local Claude Code or Codex
+CLI conversation tree, including abandoned sibling branches that stock
+`--resume` can't reach natively.
 
 Quick usage:
-    atr                       interactive list of conversations in current dir
-    atr -L                    only branch tails (leaf nodes)
-    atr "browser tools"       keyword search across prompts
-    atr resume <uuid-prefix>  generate resume command for a specific node
-    atr -x                    after picking, exec `claude --resume` for you
+    treeflow                       interactive list of conversations in current dir
+    treeflow -L                    only branch tails (leaf nodes)
+    treeflow search "browser"      keyword search across prompts
+    treeflow resume <uuid-prefix>  generate resume command for a specific node
+    treeflow -x                    after picking, exec the agent CLI for you
 """
 from __future__ import annotations
 
@@ -46,21 +46,21 @@ _CONFIG_DEFAULTS: Dict[str, Any] = {
 
 
 def _load_config() -> Dict[str, Any]:
-    """Layer config: in-code defaults → bundled atr.toml → user override.
+    """Layer config: in-code defaults → bundled treeflow.toml → user override.
 
     User override paths (first that exists wins, after defaults+bundled):
-      $ATR_CONFIG    — explicit path, if set
-      ~/.config/atr/atr.toml
-      ~/.atr.toml
+      $TREEFLOW_CONFIG    — explicit path, if set
+      ~/.config/treeflow/treeflow.toml
+      ~/.treeflow.toml
 
     Missing keys at any layer fall through to the previous layer, so old
     user configs keep working after we add fields."""
-    candidates: List[Path] = [Path(__file__).parent / "atr.toml"]
-    env_override = os.environ.get("ATR_CONFIG")
+    candidates: List[Path] = [Path(__file__).parent / "treeflow.toml"]
+    env_override = os.environ.get("TREEFLOW_CONFIG")
     if env_override:
         candidates.append(Path(env_override).expanduser())
-    candidates.append(Path.home() / ".config" / "atr" / "atr.toml")
-    candidates.append(Path.home() / ".atr.toml")
+    candidates.append(Path.home() / ".config" / "treeflow" / "treeflow.toml")
+    candidates.append(Path.home() / ".treeflow.toml")
 
     merged: Dict[str, Any] = {k: (dict(v) if isinstance(v, dict) else v)
                               for k, v in _CONFIG_DEFAULTS.items()}
@@ -72,7 +72,7 @@ def _load_config() -> Dict[str, Any]:
         try:
             with path.open("rb") as f:
                 data = tomllib.load(f)
-        except Exception:  # noqa: BLE001  -- malformed config never crashes atr
+        except Exception:  # noqa: BLE001  -- malformed config never crashes treeflow
             continue
         for k, v in data.items():
             if isinstance(v, dict) and isinstance(merged.get(k), dict):
@@ -576,7 +576,7 @@ def _codex_load_sessions(cwd_filter: Optional[str], all_projects: bool = False) 
 
 
 def _codex_build_nodes(sessions: Dict[str, dict]) -> Tuple[Dict[str, dict], set]:
-    """Map Codex's session/prompt schema onto atr's node graph.
+    """Map Codex's session/prompt schema onto treeflow's node graph.
 
     Each user prompt becomes a node with uuid `<session_id>:<index>`. Within a
     session, prompts chain linearly (parent = previous prompt). When a session
@@ -1125,12 +1125,12 @@ def _browse_render(state: dict, items: List[dict], all_nodes: Dict[str, dict],
     leaf_total = sum(1 for n in all_nodes.values() if not n["children"])
     proj_str = _truncate_w(str(project_dir), cols - 14)
     lines: List[str] = [
-        bold("atr") + dim("  ") + dim(_truncate_w(scope_summary, cols - 6)),
+        bold("treeflow") + dim("  ") + dim(_truncate_w(scope_summary, cols - 6)),
         dim(f"  {proj_str}"),
         (dim("  nodes ") + bold(str(len(all_nodes)))
          + dim(" · leaves ") + bold(str(leaf_total))
          + dim(" · native ") + purple(f"★ {len(native)}")
-         + dim(" · atr-only ") + str(len(all_nodes) - len(native))),
+         + dim(" · treeflow-only ") + str(len(all_nodes) - len(native))),
     ]
     # search bar — always visible, cursor block at end
     cursor = green("▌")
@@ -1384,7 +1384,7 @@ def _print_summary(project_dir: Path, total: int, native: int, leaves: int) -> N
         dim("nodes total: ") + bold(str(total))
         + dim("   leaves: ") + bold(str(leaves))
         + dim("   native: ") + purple(f"★ {native}")
-        + dim(f"   atr-only: ") + str(total - native)
+        + dim(f"   treeflow-only: ") + str(total - native)
     )
 
 
@@ -1422,7 +1422,7 @@ def _show_items(args, items: List[dict], nodes: Dict[str, dict], native: set,
             dim("nodes total: ") + bold(str(len(nodes)))
             + dim("   leaves: ") + bold(str(leaf_count))
             + dim("   native: ") + purple(f"★ {len(native)}")
-            + dim("   atr-only: ") + str(len(nodes) - len(native)),
+            + dim("   treeflow-only: ") + str(len(nodes) - len(native)),
             out,
         )
         if highlight:
@@ -1442,8 +1442,8 @@ def _show_items(args, items: List[dict], nodes: Dict[str, dict], native: set,
 
 
 def cmd_browse(args):
-    """CLI dump for `atr list` / `atr leaves`. Pure print, no interactive
-    picker — the picker is reached via bare `atr` which opens browse_project."""
+    """CLI dump for `treeflow list` / `treeflow leaves`. Pure print, no interactive
+    picker — the picker is reached via bare `treeflow` which opens browse_project."""
     pd, nodes, native, _raw = _gather(args, args.path, getattr(args, "scope_root", None))
     items = list(nodes.values())
     if args.leaves:
@@ -1491,7 +1491,7 @@ def cmd_tree(args) -> None:
             dim("nodes total: ") + bold(str(len(nodes)))
             + dim("   leaves: ") + bold(str(leaf_count))
             + dim("   native: ") + purple(f"★ {len(native)}")
-            + dim("   atr-only: ") + str(len(nodes) - len(native)),
+            + dim("   treeflow-only: ") + str(len(nodes) - len(native)),
             out,
         )
         _emit("", out)
@@ -1695,7 +1695,7 @@ def _emit_node_listing(pd: Path, nodes: dict, native: set,
             "total": len(nodes),
             "leaves": leaf_count,
             "native": len(native),
-            "atr_only": len(nodes) - len(native),
+            "treeflow_only": len(nodes) - len(native),
         },
         "count": len(items),
         "items": [_node_to_dict(n, native) for n in items],
@@ -1747,9 +1747,9 @@ def _add_json_flag(p: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        prog="atr",
-        description="agent tree resume — browse and resume any node in your local "
-                    "Claude Code conversation tree, including abandoned branches.",
+        prog="treeflow",
+        description="treeflow — browse and resume any node in your local Claude "
+                    "Code / Codex CLI conversation tree, including abandoned branches.",
     )
     ap.add_argument("-p", "--path", default=None,
                     help="project path (default: pick interactively or use cwd)")
@@ -1933,7 +1933,7 @@ def _root_render(roots: List[dict], selected: int, offset: int,
     title_w = max(15, cols - head_w - dir_w - 2)
     scope = _truncate_w(scope_note, cols - 9)  # "  scope: " is 9 cells
     lines = [
-        bold("atr") + dim(" · pick a conversation root"),
+        bold("treeflow") + dim(" · pick a conversation root"),
         dim("    ↑↓ move · ⏎ select · 1-9 jump · a scope · q quit"),
         dim(f"    scope: {scope}"),
         "",
@@ -2051,7 +2051,7 @@ def pick_project(default_path: str, all_projects: bool = False,
 
 # (Old action menu removed — the post-project flow is now the unified
 # `browse_project` browser with a persistent search box and Tab-cycled
-# view modes. Use the `atr <subcommand>` CLI for non-interactive workflows.)
+# view modes. Use the `treeflow <subcommand>` CLI for non-interactive workflows.)
 
 
 class _RawInput:
@@ -2066,7 +2066,7 @@ class _RawInput:
         self.fd = sys.stdin.fileno()
         self.old = termios.tcgetattr(self.fd)
         tty.setcbreak(self.fd)
-        self.log = (os.environ.get("ATR_DEBUG_KEYS") == "1"
+        self.log = (os.environ.get("TREEFLOW_DEBUG_KEYS") == "1"
                     or bool(_cfg("debug", "log_keys", default=False)))
 
     def close(self) -> None:
@@ -2109,7 +2109,7 @@ class _RawInput:
             if self.log:
                 raw = "".join(seq)
                 hexed = " ".join(f"{ord(c):02x}" for c in raw)
-                sys.stderr.write(f"[atr-keys] {label}  raw=[{hexed}]\n")
+                sys.stderr.write(f"[treeflow-keys] {label}  raw=[{hexed}]\n")
                 sys.stderr.flush()
             return label
 

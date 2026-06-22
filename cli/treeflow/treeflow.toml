@@ -1,13 +1,15 @@
-# atr — agent tree resume CLI configuration
-# Lives next to atr.py. Edit and restart atr to apply changes.
-# Environment variables (CLAUDE_PROJECTS_DIR, ATR_DEBUG_KEYS, NO_COLOR) still override these.
+# treeflow — agent conversation tree CLI configuration
+# Lives next to treeflow's package code. Edit and restart treeflow to apply changes.
+# Environment variables (CLAUDE_PROJECTS_DIR, CODEX_SESSIONS_DIR, TREEFLOW_DEBUG_KEYS,
+# NO_COLOR) still override these.
 
 
 # Rows shown per page in any paginated view (project picker, node list, tree).
 page_size = 15
 
 # Which agent CLI to drive by default. One of: "claude" | "codex".
-# Override per-invocation with `atr --claude` / `atr --codex` / `atr --tool codex`.
+# Override per-invocation with `treeflow --claude` / `treeflow --codex`
+# / `treeflow --tool codex`.
 tool = "claude"
 
 
@@ -33,5 +35,5 @@ tree_order = "oldest_first"
 [debug]
 
 # Log every keypress (raw bytes) to stderr — useful when arrow keys misbehave.
-# The env var ATR_DEBUG_KEYS=1 also turns this on.
+# The env var TREEFLOW_DEBUG_KEYS=1 also turns this on.
 log_keys = false

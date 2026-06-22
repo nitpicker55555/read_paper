@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 
 [project]
-name = "agent-tree-resume"
+name = "treeflow"
 version = "0.1.0"
-description = "Browse and resume any node in your local Claude Code conversation tree — including the abandoned sibling branches that stock `claude --resume` can't reach."
+description = "TreeFlow — browse and resume any node in your local Claude Code or Codex CLI conversation tree, including abandoned sibling branches that stock `--resume` can't reach."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "puzhen" }]
 requires-python = ">=3.11"
-keywords = ["claude", "claude-code", "cli", "resume", "session", "tree", "tui"]
+keywords = ["claude", "claude-code", "codex", "cli", "resume", "session", "tree", "tui"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -31,7 +31,7 @@ dependencies = []
 
 
 [project.scripts]
-atr = "atr:main"
+treeflow = "treeflow:main"
 
 
 [project.urls]
@@ -41,9 +41,9 @@ Issues = "https://github.com/nitpicker55555/Agent-Treeflow/issues"
 
 
 [tool.setuptools]
-packages = ["atr"]
+packages = ["treeflow"]
 
 # Bundle the default config TOML next to the installed module so _load_config
-# can find it at runtime via Path(__file__).parent / "atr.toml".
+# can find it at runtime via Path(__file__).parent / "treeflow.toml".
 [tool.setuptools.package-data]
-atr = ["atr.toml"]
+treeflow = ["treeflow.toml"]
