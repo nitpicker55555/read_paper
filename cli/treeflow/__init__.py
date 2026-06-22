@@ -757,6 +757,26 @@ class ClaudeDriver:
     def emit_resume(self, project_dir: Path, node: dict, raw: Any, exec_after: bool) -> None:
         emit_resume(project_dir, node, raw, exec_after)
 
+    def prepare_resume(self, project_dir: Path, node: dict, raw: Any
+                       ) -> Tuple[str, Optional[Path], int]:
+        """Resolve the session id we'd resume into without execing. Returns
+        (sid, file_path_or_None, chain_length). Native targets return the
+        original sid and write no file. Non-native targets synthesize a fresh
+        session file and return the new sid + path."""
+        native_sid = node.get("native_session_id")
+        if native_sid:
+            return native_sid, None, 0
+        new_sid, chain_len, new_path = write_synthetic_session(
+            project_dir, node["uuid"], raw)
+        return new_sid, new_path, chain_len
+
+    def exec_resume(self, sid: str) -> None:
+        try:
+            os.execvp("claude", ["claude", "--resume", sid])
+        except FileNotFoundError:
+            print(red("  ! `claude` not found — install Claude Code CLI and put it on PATH"))
+            sys.exit(2)
+
     def scan_roots(self, cwd: str, all_projects: bool) -> Tuple[List[dict], str]:
         return _scan_roots(cwd, all_projects=all_projects)
 
@@ -792,6 +812,21 @@ class CodexDriver:
 
     def emit_resume(self, project_dir: Path, node: dict, raw: Any, exec_after: bool) -> None:
         _codex_emit_resume(node, exec_after)
+
+    def prepare_resume(self, project_dir: Path, node: dict, raw: Any
+                       ) -> Tuple[str, Optional[Path], int]:
+        native_sid = node.get("native_session_id")
+        if native_sid:
+            return native_sid, None, 0
+        new_sid, chain_len, new_path = _codex_write_synthetic(node)
+        return new_sid, new_path, chain_len
+
+    def exec_resume(self, sid: str) -> None:
+        try:
+            os.execvp("codex", ["codex", "resume", sid])
+        except FileNotFoundError:
+            print(red("  ! `codex` not found — install OpenAI Codex CLI and put it on PATH"))
+            sys.exit(2)
 
     def scan_roots(self, cwd: str, all_projects: bool) -> Tuple[List[dict], str]:
         sessions = _codex_load_sessions(cwd, all_projects=all_projects)
@@ -1291,11 +1326,16 @@ def _compute_browse_items(state: dict, all_nodes: Dict[str, dict]) -> List:
 
 
 def _render_node_detail(node: dict, driver: Any, native_set: set,
-                        project_dir: Path) -> None:
+                        project_dir: Path,
+                        revealed: Optional[Tuple[str, Optional[Path], int]]
+                        ) -> None:
     """Print the full detail view for a node — both halves of the turn plus
-    the resume command. Runs inside the alternate screen buffer, so we can
-    print as much as we want without worrying about preserving the layout."""
+    the resume command. `revealed` is None before the user has confirmed
+    they want to see the concrete command; once set it's
+    (sid, file_path_or_None, chain_length) and the placeholder is replaced.
+    Runs inside the alternate screen buffer."""
     cols = shutil.get_terminal_size((140, 24)).columns
+    rule_w = min(cols, 100)
     uid = node["uuid"]
     is_native = uid in native_set
     native_sid = node.get("native_session_id")
@@ -1303,7 +1343,7 @@ def _render_node_detail(node: dict, driver: Any, native_set: set,
     prompt = (node.get("text") or "").rstrip()
 
     print(bold("treeflow") + dim(" · node detail"))
-    print(dim("─" * min(cols, 100)))
+    print(dim("─" * rule_w))
     print(f"  {bold('uuid')      :<18}  {uid}")
     print(f"  {bold('time')      :<18}  {_format_time(node['timestamp'])}"
           + dim(f"   ({node['timestamp'] or '—'})"))
@@ -1316,46 +1356,69 @@ def _render_node_detail(node: dict, driver: Any, native_set: set,
     print(f"  {bold('children')  :<18}  {len(node['children'])}")
     print()
 
-    print(bold("── user prompt ") + dim("─" * max(0, min(cols, 100) - 16)))
+    print(bold("── user prompt ") + dim("─" * max(0, rule_w - 16)))
     print(prompt if prompt else dim("(empty)"))
     print()
 
-    print(bold("── assistant reply ") + dim("─" * max(0, min(cols, 100) - 20)))
+    print(bold("── assistant reply ") + dim("─" * max(0, rule_w - 20)))
     if reply:
         print(reply)
     else:
         print(dim("(no recorded assistant reply for this node)"))
     print()
 
-    print(bold("── resume ") + dim("─" * max(0, min(cols, 100) - 11)))
-    if native_sid:
+    print(bold("── resume ") + dim("─" * max(0, rule_w - 11)))
+    if revealed is not None:
+        sid, file_path, chain_len = revealed
+        cmd = f"{driver.resume_verb} {sid}"
+        print(f"  {bold('$')} {green(cmd)}")
+        if file_path is None:
+            print(dim("  native target — no synthetic file written"))
+        else:
+            print(dim(f"  synthesized → {Path(file_path).name}  "
+                      f"({chain_len}-line chain)"))
+        hint = "⏎ launch agent now · ← / ⎋ back to browser · ^C quit"
+    elif native_sid:
         cmd = f"{driver.resume_verb} {native_sid}"
-        print(f"  {bold('$')} {cmd}")
+        print(f"  {bold('$')} {green(cmd)}")
         print(dim("  native target — stock `--resume` already lands here, "
                   "no synthetic file needed"))
+        hint = "⏎ launch agent now · ← / ⎋ back to browser · ^C quit"
     else:
-        print(dim(f"  This node is on an abandoned branch. treeflow will "
-                  f"write a fresh\n  synthetic session file and run:"))
+        print(dim("  This node is on an abandoned branch. Press ⏎ to "
+                  "synthesize a fresh"))
+        print(dim("  session file and reveal the exact resume command:"))
         print()
         print(f"  {bold('$')} {driver.resume_verb} {dim('<new-session-id>')}")
+        hint = "⏎ reveal command · ← / ⎋ back to browser · ^C quit"
     print()
-    print(dim("  ⏎ resume · ← / ⎋ back · ^C quit"))
+    print(dim(f"  {hint}"))
 
 
 def _show_node_detail(node: dict, raw: "_RawInput", driver: Any,
-                      native_set: set, project_dir: Path) -> Optional[object]:
-    """Detail screen for one picked node. Uses the alternate screen buffer so
-    long prompts/replies render cleanly without clobbering the browser layout
-    underneath. Returns BACK (go back to browser), True (proceed to resume),
-    or None (quit)."""
-    # Enter alt screen + clear + cursor home.
+                      native_set: set, project_dir: Path,
+                      raw_data: Any, auto_exec: bool
+                      ) -> Optional[object]:
+    """Detail screen for one picked node. Two-stage Enter:
+
+      1. Non-native node, not revealed yet: ⏎ synthesizes the fresh session
+         file and updates the on-screen command from the `<new-session-id>`
+         placeholder to the real session id. Stays on screen.
+      2. Already revealed (or native): ⏎ execs the agent CLI on that sid.
+
+      When `auto_exec` is True (top-level `-x` or `[browser] auto_exec`),
+      the two stages fold into one — the first ⏎ both synthesizes and execs.
+
+    Returns BACK to go back to the browser, or None on Ctrl+C. Successful
+    launch never returns (os.execvp replaces the process)."""
+    revealed: Optional[Tuple[str, Optional[Path], int]] = None
     sys.stdout.write("\x1b[?1049h\x1b[H\x1b[2J")
     sys.stdout.flush()
     try:
         while True:
             sys.stdout.write("\x1b[H\x1b[2J")
             sys.stdout.flush()
-            _render_node_detail(node, driver, native_set, project_dir)
+            _render_node_detail(node, driver, native_set, project_dir, revealed)
             try:
                 key = raw.read_key()
             except KeyboardInterrupt:
@@ -1363,8 +1426,27 @@ def _show_node_detail(node: dict, raw: "_RawInput", driver: Any,
             if key in ("left", "esc", "backspace", "q", "Q"):
                 return BACK
             if key == "enter":
-                return True
-            # Any other key: just redraw (no state change in the detail view).
+                native_sid = node.get("native_session_id")
+                if revealed is None and not native_sid:
+                    # First ⏎ on an abandoned-branch node: synthesize now.
+                    revealed = driver.prepare_resume(project_dir, node, raw_data)
+                    if auto_exec:
+                        # Single-step mode: launch immediately. Leave alt
+                        # screen first so the new process inherits a clean tty.
+                        sys.stdout.write("\x1b[?1049l")
+                        sys.stdout.flush()
+                        driver.exec_resume(revealed[0])
+                        return None  # exec failed (e.g. FileNotFoundError)
+                    # Stay on screen — next render shows the real command.
+                    continue
+                # Native target, or non-native that has already been
+                # revealed: this ⏎ is the launch.
+                sid = revealed[0] if revealed is not None else native_sid
+                sys.stdout.write("\x1b[?1049l")
+                sys.stdout.flush()
+                driver.exec_resume(sid)
+                return None
+            # Any other key: just redraw (no state change).
     finally:
         # Leave alt screen — the browser underneath is restored exactly.
         sys.stdout.write("\x1b[?1049l")
@@ -1372,7 +1454,8 @@ def _show_node_detail(node: dict, raw: "_RawInput", driver: Any,
 
 
 def browse_project(project_dir: Path, all_nodes: Dict[str, dict], native: set,
-                   scope_summary: str = "", driver: Any = None
+                   scope_summary: str = "", driver: Any = None,
+                   raw_data: Any = None, auto_exec: bool = False
                    ) -> Optional[object]:
     """The unified post-project browser. Combines view-mode switching with a
     live search box. Returns either a node dict (to resume), BACK (go back to
@@ -1414,19 +1497,19 @@ def browse_project(project_dir: Path, all_nodes: Dict[str, dict], native: set,
                     entry = items[state["selected"]]
                     node = entry.get("node") if isinstance(entry, dict) and "filler" in entry else entry
                     if node and driver is not None:
-                        # Pop into the detail view. If the user backs out we
-                        # come straight back to the same browser screen with
-                        # selection preserved; if they confirm, return the
-                        # node up to main() to do the resume.
-                        decision = _show_node_detail(node, raw, driver, native, project_dir)
+                        # Pop into the detail view. The detail view owns
+                        # synthesis + exec from here on. If the user backs
+                        # out we come straight back to the same browser
+                        # screen with selection preserved; if they launch,
+                        # os.execvp replaces the process and never returns.
+                        decision = _show_node_detail(
+                            node, raw, driver, native, project_dir,
+                            raw_data, auto_exec)
                         if decision is None:
                             _menu_clear(drawn)
                             return None
-                        if decision is BACK:
-                            continue
-                        # decision is True → resume this node.
-                        _menu_clear(drawn)
-                        return node
+                        # decision is BACK → stay in the browser.
+                        continue
                     elif node:
                         # No driver provided (e.g. test) — keep legacy behavior.
                         _menu_clear(drawn)
@@ -2331,7 +2414,14 @@ def main(argv: Optional[List[str]] = None) -> None:
                     if len(snippet) > 50:
                         snippet = snippet[:49] + "…"
                     scope_summary = f"{chosen_path} · root {chosen_root[:8]} · {snippet}"
-            result = browse_project(pd, nodes, native, scope_summary, driver=driver)
+            # Auto-exec is the user opt-in to fold the detail view's two-
+            # stage Enter (reveal → launch) into a single Enter. Top-level
+            # `-x` and `[browser] auto_exec = true` both flip this on.
+            auto_exec = bool(getattr(args, "exec_", False)) or bool(
+                _cfg("browser", "auto_exec", default=False))
+            result = browse_project(pd, nodes, native, scope_summary,
+                                    driver=driver, raw_data=raw,
+                                    auto_exec=auto_exec)
             if result is None:
                 return
             if result is BACK:
@@ -2339,11 +2429,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 chosen_root = None
                 layer = "project"
                 continue
-            # result is a node dict — resume it via the driver. Auto-exec the
-            # agent CLI if the user passed `-x` at the top level OR set
-            # `auto_exec = true` under `[browser]` in their config.
-            auto_exec = bool(getattr(args, "exec_", False)) or bool(
-                _cfg("browser", "auto_exec", default=False))
+            # Legacy path (driver=None): detail view skipped, emit resume here.
             driver.emit_resume(pd, result, raw, exec_after=auto_exec)
             return
 
