@@ -5,7 +5,7 @@
 
 
 # Rows shown per page in any paginated view (project picker, node list, tree).
-page_size = 15
+page_size = 50
 
 # Which agent CLI to drive by default. One of: "claude" | "codex".
 # Override per-invocation with `treeflow --claude` / `treeflow --codex`

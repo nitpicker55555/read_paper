@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover  -- 3.10 fallback
 # ---------- config ----------
 
 _CONFIG_DEFAULTS: Dict[str, Any] = {
-    "page_size": 15,
+    "page_size": 50,
     "tool": "claude",                    # which agent CLI to target by default
     "paths": {
         "claude_projects_dir": "~/.claude/projects",
@@ -1063,7 +1063,7 @@ def with_pager(render_fn) -> str:
     return text
 
 
-_NODE_PAGE = int(_cfg("page_size", default=15))
+_NODE_PAGE = int(_cfg("page_size", default=50))
 _VIEW_CYCLE = ("tree", "list", "leaves")
 
 
@@ -2107,7 +2107,7 @@ def _scan_roots(base_path: str, all_projects: bool = False) -> Tuple[List[dict],
     return roots, scope
 
 
-_PROJECT_PAGE = int(_cfg("page_size", default=15))
+_PROJECT_PAGE = int(_cfg("page_size", default=50))
 
 
 def _root_render(roots: List[dict], selected: int, offset: int,
