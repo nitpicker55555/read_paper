@@ -61,6 +61,15 @@ CLAUDE_PROJECTS_DIR = Path(
 )
 
 
+# Sentinel returned by pickers when the user wants to back up one layer.
+# `None` keeps meaning "quit the whole interactive flow".
+class _BackSentinel:
+    def __repr__(self) -> str: return "BACK"
+
+
+BACK = _BackSentinel()
+
+
 # ---------- ansi colors ----------
 
 _USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
@@ -446,7 +455,7 @@ def _pick_node_render(items: List[dict], native_reachable: set, selected: int,
     if query:
         lines.append(dim("query: ") + bold(repr(query))
                      + dim("   matches: ") + bold(str(len(items))))
-    lines.append(dim("↑↓ move · ⏎ select · 1-9 jump · q quit"))
+    lines.append(dim("↑↓ move · ⏎ select · 1-9 jump · ⎋ back · q quit"))
     lines.append("")
     head_line = (f"  {'#'.rjust(num_w + 1)}  {'time':<11}  {'uuid':<8}  L  ★  prompt")
     lines.append(dim(head_line))
@@ -515,9 +524,12 @@ def pick_node_interactive(items: List[dict], native_reachable: set,
             elif key == "enter":
                 _menu_clear(drawn)
                 return items[selected]
-            elif key in ("q", "Q", "esc"):
+            elif key in ("q", "Q"):
                 _menu_clear(drawn)
                 return None
+            elif key in ("esc", "left", "backspace"):
+                _menu_clear(drawn)
+                return BACK
             elif key.isdigit() and key != "0":
                 idx = int(key) - 1
                 if 0 <= idx < len(items):
@@ -618,26 +630,34 @@ def _show_items(args, items: List[dict], nodes: Dict[str, dict], native: set,
 
 
 def _maybe_pick(args, items, nodes, native, pd, by_uuid,
-                highlight: str = "", query: str = "") -> bool:
-    """Returns True if the paginated picker was used (and the table dump should
-    be skipped). Returns False if non-tty or non-pick mode — caller falls back
-    to _show_items + no input prompt."""
+                highlight: str = "", query: str = ""):
+    """Drive the paginated node picker when in interactive pick mode.
+
+    Returns:
+      None  — picker wasn't used (non-tty or no items); caller should fall
+              back to the static table dump.
+      BACK  — user wants to go back one layer.
+      True  — picker handled the flow (selected or quit). Caller is done.
+    """
     tree_mode = getattr(args, "tree", False)
     if not (args.pick and items and not tree_mode
             and sys.stdin.isatty() and sys.stdout.isatty()):
-        return False
+        return None
     leaf_count = sum(1 for n in nodes.values() if not n["children"])
     choice = pick_node_interactive(
         items, native, pd,
         leaf_count=leaf_count, total=len(nodes), native_count=len(native),
         highlight=highlight, query=query,
     )
-    if choice:
-        emit_resume(pd, choice, by_uuid, exec_after=args.exec_)
+    if choice is BACK:
+        return BACK
+    if choice is None:
+        return True  # quit
+    emit_resume(pd, choice, by_uuid, exec_after=args.exec_)
     return True
 
 
-def cmd_browse(args) -> None:
+def cmd_browse(args):
     pd, nodes, native, by_uuid = _gather(args.path, getattr(args, "scope_root", None))
     items = list(nodes.values())
     if args.leaves:
@@ -646,12 +666,20 @@ def cmd_browse(args) -> None:
     if args.limit:
         items = items[: args.limit]
 
-    if _maybe_pick(args, items, nodes, native, pd, by_uuid):
-        return
+    if getattr(args, "json", False):
+        _emit_node_listing(pd, nodes, native, items)
+        return None
+
+    handled = _maybe_pick(args, items, nodes, native, pd, by_uuid)
+    if handled is BACK:
+        return BACK
+    if handled:
+        return None
     _show_items(args, items, nodes, native, pd)
+    return None
 
 
-def cmd_search(args) -> None:
+def cmd_search(args):
     pd, nodes, native, by_uuid = _gather(args.path, getattr(args, "scope_root", None))
     q = args.query.lower()
     matches = [n for n in nodes.values() if q in n["text"].lower()]
@@ -659,15 +687,27 @@ def cmd_search(args) -> None:
     if args.limit:
         matches = matches[: args.limit]
 
-    if _maybe_pick(args, matches, nodes, native, pd, by_uuid,
-                   highlight=args.query, query=args.query):
-        return
+    if getattr(args, "json", False):
+        _emit_node_listing(pd, nodes, native, matches, query=args.query)
+        return None
+
+    handled = _maybe_pick(args, matches, nodes, native, pd, by_uuid,
+                         highlight=args.query, query=args.query)
+    if handled is BACK:
+        return BACK
+    if handled:
+        return None
     _show_items(args, matches, nodes, native, pd, highlight=args.query)
+    return None
 
 
 def cmd_tree(args) -> None:
     """Dedicated tree-view command. Always tree, never pick."""
     pd, nodes, native, _by_uuid = _gather(args.path, getattr(args, "scope_root", None))
+
+    if getattr(args, "json", False):
+        _emit_tree_json(pd, nodes, native)
+        return
 
     def render(out):
         _emit(dim(f"project dir: {pd}"), out)
@@ -690,9 +730,21 @@ def cmd_resume(args) -> None:
     pd, nodes, _native, by_uuid = _gather(args.path, getattr(args, "scope_root", None))
     matches = [u for u in by_uuid if u.startswith(args.uuid)]
     if not matches:
-        print(red(f"no uuid starts with {args.uuid!r}"), file=sys.stderr)
-        sys.exit(2)
+        _fail(f"no uuid starts with {args.uuid!r}", args)
     if len(matches) > 1:
+        if getattr(args, "json", False):
+            _emit_json({
+                "error": "ambiguous_prefix",
+                "prefix": args.uuid,
+                "matches": [
+                    {
+                        "uuid": m,
+                        "text": _user_text((by_uuid[m][0].get("message") or {}).get("content"))[:80],
+                    }
+                    for m in matches[:20]
+                ],
+            })
+            sys.exit(2)
         print(red(f"prefix {args.uuid!r} is ambiguous ({len(matches)} matches):"), file=sys.stderr)
         for m in matches[:6]:
             text = _user_text((by_uuid[m][0].get("message") or {}).get("content"))[:60]
@@ -703,22 +755,47 @@ def cmd_resume(args) -> None:
     if node is None:
         text = _user_text((by_uuid[target][0].get("message") or {}).get("content"))[:80]
         node = {"uuid": target, "text": text}
-        print(yellow(f"⚠ {target[:8]} is not a user prompt ({by_uuid[target][0].get('type')}) — trying anyway"), file=sys.stderr)
-    emit_resume(pd, node, by_uuid, exec_after=args.exec_)
+        if not getattr(args, "json", False):
+            print(yellow(f"⚠ {target[:8]} is not a user prompt ({by_uuid[target][0].get('type')}) — trying anyway"), file=sys.stderr)
+
+    new_sid, chain_len, new_path = write_synthetic_session(pd, target, by_uuid)
+    cmd_str = f"claude --resume {new_sid}"
+    if getattr(args, "json", False):
+        _emit_json({
+            "target_uuid": target,
+            "target_text": node.get("text", ""),
+            "session_id": new_sid,
+            "file": str(new_path),
+            "chain_length": chain_len,
+            "command": cmd_str,
+        })
+    else:
+        print()
+        print(green(f"  ✓ synthesized session ({chain_len}-link chain) → {new_path.name}"))
+        print(bold(f"  $ {cmd_str}"))
+        print()
+    if args.exec_:
+        if not getattr(args, "json", False):
+            print(dim("  → exec…"))
+        try:
+            os.execvp("claude", ["claude", "--resume", new_sid])
+        except FileNotFoundError:
+            print(red("  ! `claude` not found — install Claude Code CLI and put it on PATH"))
+            sys.exit(2)
 
 
 def cmd_info(args) -> None:
     pd, nodes, native, by_uuid = _gather(args.path, getattr(args, "scope_root", None))
     matches = [u for u in nodes if u.startswith(args.uuid)]
     if not matches:
-        print(red(f"no uuid starts with {args.uuid!r}"), file=sys.stderr)
-        sys.exit(2)
+        _fail(f"no uuid starts with {args.uuid!r}", args)
     if len(matches) > 1:
-        print(red(f"prefix {args.uuid!r} is ambiguous"), file=sys.stderr)
-        for m in matches[:6]:
-            print(f"  {m}", file=sys.stderr)
-        sys.exit(2)
+        _fail(f"prefix {args.uuid!r} is ambiguous", args,
+              extra={"matches": matches[:20]})
     n = nodes[matches[0]]
+    if getattr(args, "json", False):
+        _emit_json(_node_to_dict(n, native, full_text=True))
+        return
     print()
     print(bold("uuid       ") + n["uuid"])
     print(bold("session    ") + n["session_id"])
@@ -733,6 +810,130 @@ def cmd_info(args) -> None:
     for line in n["text"].splitlines():
         print(f"  {line}")
     print()
+
+
+def cmd_roots(args) -> None:
+    """List the root conversations under a project path. Designed for agents:
+    pair with `--json` to get a machine-readable inventory; pair with
+    `--all` to scan every jsonl dir under ~/.claude/projects/."""
+    roots, scope = _scan_roots(args.path or os.getcwd(),
+                               all_projects=getattr(args, "all_projects", False))
+    if getattr(args, "json", False):
+        _emit_json({
+            "scope": scope,
+            "count": len(roots),
+            "roots": [
+                {
+                    "uuid": r["root_uuid"],
+                    "uuid_short": r["root_uuid"][:8],
+                    "project_dir": r["project_dir"],
+                    "cwd": r["cwd"],
+                    "first_seen": r["first_seen"],
+                    "last_active": r["last_active"],
+                    "node_count": r["node_count"],
+                    "native_at_root": r["native_at_root"],
+                    "native_in_subtree": r["native_in_subtree"],
+                    "text": r["title"],
+                }
+                for r in roots
+            ],
+        })
+        return
+    print(dim(f"scope: {scope}"))
+    print(dim("roots: ") + bold(str(len(roots))))
+    print()
+    for i, r in enumerate(roots, 1):
+        nat = purple("★ ") if r["native_at_root"] else "  "
+        ts = "—"
+        if r["last_active"]:
+            try:
+                ts = datetime.fromisoformat(r["last_active"].replace("Z", "+00:00")).astimezone().strftime("%m-%d %H:%M")
+            except ValueError:
+                ts = r["last_active"][:11]
+        title = re.sub(r"\s+", " ", r["title"]).strip()
+        nodes_str = f"{r['node_count']:>4}n"
+        print(f"  {i:>3}. {nat}{dim(r['root_uuid'][:8])}  {dim(ts)}  "
+              f"{dim(nodes_str)}  {title[:100]}")
+
+
+# ---------- JSON / serialization helpers ----------
+
+def _emit_json(obj) -> None:
+    json.dump(obj, sys.stdout, ensure_ascii=False, indent=2, default=str)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def _fail(msg: str, args, extra: Optional[dict] = None) -> None:
+    """Error exit. JSON mode emits a structured error to stdout; otherwise
+    prints to stderr. Always exits 2."""
+    if getattr(args, "json", False):
+        payload = {"error": msg}
+        if extra:
+            payload.update(extra)
+        _emit_json(payload)
+    else:
+        print(red(msg), file=sys.stderr)
+    sys.exit(2)
+
+
+def _node_to_dict(n: dict, native: set, full_text: bool = False) -> dict:
+    text = n["text"] if full_text else re.sub(r"\s+", " ", n["text"]).strip()[:200]
+    return {
+        "uuid": n["uuid"],
+        "uuid_short": n["uuid"][:8],
+        "timestamp": n["timestamp"],
+        "session_id": n["session_id"],
+        "cwd": n["cwd"],
+        "parent_uuid": n["parent"],
+        "child_uuids": list(n["children"]),
+        "is_leaf": not n["children"],
+        "native_reachable": n["uuid"] in native,
+        "text": text,
+    }
+
+
+def _emit_node_listing(pd: Path, nodes: dict, native: set,
+                       items: List[dict], query: str = "") -> None:
+    leaf_count = sum(1 for n in nodes.values() if not n["children"])
+    payload = {
+        "project_dir": str(pd),
+        "stats": {
+            "total": len(nodes),
+            "leaves": leaf_count,
+            "native": len(native),
+            "atr_only": len(nodes) - len(native),
+        },
+        "count": len(items),
+        "items": [_node_to_dict(n, native) for n in items],
+    }
+    if query:
+        payload["query"] = query
+    _emit_json(payload)
+
+
+def _emit_tree_json(pd: Path, nodes: dict, native: set) -> None:
+    def to_node(uuid_: str) -> dict:
+        n = nodes[uuid_]
+        return {
+            "uuid": uuid_,
+            "uuid_short": uuid_[:8],
+            "timestamp": n["timestamp"],
+            "is_leaf": not n["children"],
+            "native_reachable": uuid_ in native,
+            "text": re.sub(r"\s+", " ", n["text"]).strip()[:200],
+            "children": [to_node(c) for c in n["children"]],
+        }
+    roots = [u for u, n in nodes.items() if not (n["parent"] and n["parent"] in nodes)]
+    _emit_json({
+        "project_dir": str(pd),
+        "stats": {
+            "total": len(nodes),
+            "leaves": sum(1 for n in nodes.values() if not n["children"]),
+            "native": len(native),
+        },
+        "roots": [to_node(r) for r in roots],
+    })
 
 
 # ---------- arg parsing ----------
@@ -751,6 +952,11 @@ def _add_common_view(p: argparse.ArgumentParser, default_limit: int = 0) -> None
                    help="render as ASCII tree instead of table (overrides pick)")
 
 
+def _add_json_flag(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--json", action="store_true",
+                   help="JSON output (machine-readable; suppresses picker)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="atr",
@@ -762,39 +968,49 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("-r", "--root", default=None, dest="scope_root",
                     help="scope to a specific root conversation (uuid prefix)")
     ap.add_argument("-a", "--all", action="store_true", dest="all_projects",
-                    help="in the interactive picker, include roots from every "
-                         "~/.claude/projects/ dir, not just the one matching cwd")
+                    help="include roots from every ~/.claude/projects/ dir, "
+                         "not just the one matching cwd")
     sub = ap.add_subparsers(dest="cmd")
 
     p_list = sub.add_parser("list", aliases=["ls"], help="list conversations, most recent first")
     p_list.add_argument("-L", "--leaves", action="store_true", help="only branch tails")
     _add_common_view(p_list)
     _add_common_pick(p_list)
+    _add_json_flag(p_list)
     p_list.set_defaults(func=cmd_browse, pick=True, exec_=False, leaves=False, tree=False)
 
     p_leaves = sub.add_parser("leaves", help="show only leaf nodes (branch tails)")
     _add_common_view(p_leaves)
     _add_common_pick(p_leaves)
+    _add_json_flag(p_leaves)
     p_leaves.set_defaults(func=cmd_browse, pick=True, exec_=False, leaves=True, tree=False)
 
     p_search = sub.add_parser("search", aliases=["s"], help="search by keyword in prompt content")
     p_search.add_argument("query")
     _add_common_view(p_search)
     _add_common_pick(p_search)
+    _add_json_flag(p_search)
     p_search.set_defaults(func=cmd_search, pick=True, exec_=False, tree=False)
 
     p_tree = sub.add_parser("tree", aliases=["t"], help="ASCII tree of the whole project")
     p_tree.add_argument("-m", "--match", default="",
                         help="highlight prompts matching this substring")
+    _add_json_flag(p_tree)
     p_tree.set_defaults(func=cmd_tree)
+
+    p_roots = sub.add_parser("roots", help="list root conversations in this project")
+    _add_json_flag(p_roots)
+    p_roots.set_defaults(func=cmd_roots)
 
     p_resume = sub.add_parser("resume", aliases=["r"], help="generate resume command for a uuid prefix")
     p_resume.add_argument("uuid")
     p_resume.add_argument("-x", "--exec", action="store_true", dest="exec_")
+    _add_json_flag(p_resume)
     p_resume.set_defaults(func=cmd_resume)
 
     p_info = sub.add_parser("info", aliases=["i"], help="show full prompt for a node")
     p_info.add_argument("uuid")
+    _add_json_flag(p_info)
     p_info.set_defaults(func=cmd_info)
 
     return ap
@@ -1154,7 +1370,7 @@ def _menu_render(selected: int, project_dir: Path, scope_summary: str = "") -> i
     proj_line = _truncate_w(str(project_dir), cols - 13)  # "  project:  " = 12 cells
     lines = [
         bold("atr") + dim(" · pick an action"),
-        dim("    ↑↓ move · ⏎ select · 1-7 jump · q quit"),
+        dim("    ↑↓ move · ⏎ select · 1-7 jump · ⎋ back · q quit"),
         dim(f"    project: {proj_line}"),
     ]
     if scope_summary:
@@ -1237,9 +1453,12 @@ def interactive_menu(path: str, scope_root: Optional[str] = None) -> Optional[Tu
                 chosen_cmd = cmd
                 chosen_prompt_label = prompt_label
                 break
-            elif key in ("q", "Q", "esc"):
+            elif key in ("q", "Q"):
                 _menu_clear(drawn)
                 return None
+            elif key in ("esc", "left", "backspace"):
+                _menu_clear(drawn)
+                return BACK
             elif key.isdigit() and key != "0":
                 idx = int(key) - 1
                 if 0 <= idx < len(_MENU):
@@ -1272,7 +1491,8 @@ def interactive_menu(path: str, scope_root: Optional[str] = None) -> Optional[Tu
 def _ns_for(cmd: str, value: Optional[str], path: str,
             scope_root: Optional[str] = None) -> argparse.Namespace:
     """Build an argparse Namespace mimicking the chosen subcommand's defaults."""
-    base = {"path": path, "scope_root": scope_root}
+    base = {"path": path, "scope_root": scope_root, "json": False,
+            "all_projects": False}
     if cmd == "list":
         return argparse.Namespace(**base, cmd="list", leaves=False, limit=0,
                                   tree=False, pick=True, exec_=False, func=cmd_browse)
@@ -1302,33 +1522,62 @@ def main(argv: Optional[List[str]] = None) -> None:
         # Explicit subcommand — keep cwd as the default project unless -p was given.
         if args.path is None:
             args.path = os.getcwd()
+        # JSON mode forces non-interactive behavior for scriptability.
+        if getattr(args, "json", False):
+            if hasattr(args, "pick"):
+                args.pick = False
         args.func(args)
         return
 
-    # Interactive flow: first pick a root conversation, then pick an action.
-    chosen_path = args.path
-    chosen_root = args.scope_root
-    if chosen_path is None and sys.stdin.isatty() and sys.stdout.isatty():
-        picked = pick_project(os.getcwd(), all_projects=args.all_projects)
-        if picked is None:
-            return  # user quit
-        chosen_path, chosen_root = picked
-    elif chosen_path is None:
-        chosen_path = os.getcwd()
-
-    choice = interactive_menu(chosen_path, chosen_root) if (sys.stdin.isatty() and sys.stdout.isatty()) else None
-    if choice is None:
-        if not (sys.stdin.isatty() and sys.stdout.isatty()):
-            args = argparse.Namespace(
-                path=chosen_path, scope_root=chosen_root, cmd="list",
-                leaves=False, limit=0, tree=False, pick=False, exec_=False,
-                func=cmd_browse,
-            )
-            args.func(args)
+    # Non-tty interactive request: behave like `list` (legacy default).
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        chosen_path = args.path or os.getcwd()
+        chosen_root = args.scope_root
+        ns = argparse.Namespace(
+            path=chosen_path, scope_root=chosen_root, cmd="list",
+            leaves=False, limit=0, tree=False, pick=False, exec_=False,
+            json=False, func=cmd_browse,
+        )
+        ns.func(ns)
         return
-    cmd, value = choice
-    args = _ns_for(cmd, value, chosen_path, scope_root=chosen_root)
-    args.func(args)
+
+    # Three-layer state machine:
+    #   project picker → action menu → command (incl. node picker)
+    # `BACK` from any inner layer pops to the previous layer. `q` / quit at any
+    # layer (or `None` return) drops out of the whole interactive flow.
+    layer = "project"
+    chosen_path: Optional[str] = args.path
+    chosen_root: Optional[str] = args.scope_root
+    while True:
+        if layer == "project":
+            if chosen_path is not None:
+                # -p was passed explicitly — skip the project picker on this entry
+                # but allow BACK from the menu to bring us back here. Clear -p so
+                # a subsequent BACK actually shows the picker.
+                layer = "action"
+                continue
+            picked = pick_project(os.getcwd(), all_projects=args.all_projects)
+            if picked is None:
+                return  # quit
+            chosen_path, chosen_root = picked
+            layer = "action"
+        elif layer == "action":
+            choice = interactive_menu(chosen_path, chosen_root)
+            if choice is None:
+                return  # quit
+            if choice is BACK:
+                chosen_path = None
+                chosen_root = None
+                layer = "project"
+                continue
+            cmd, value = choice
+            ns = _ns_for(cmd, value, chosen_path, scope_root=chosen_root)
+            result = ns.func(ns)
+            if result is BACK:
+                # Back from the node picker → stay in action menu.
+                layer = "action"
+                continue
+            return
 
 
 if __name__ == "__main__":

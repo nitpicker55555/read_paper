@@ -88,6 +88,43 @@ atr -x
 atr search "bash" -x
 ```
 
+Inside any picker: `↑/↓` move, `Enter` select, `1-9` jump to that absolute
+position, `⎋` (Esc) / `←` / `Backspace` to go back to the previous layer
+(node picker → action menu → project picker), and `q` to quit immediately.
+
+## Agent / scriptable usage
+
+Every subcommand accepts `--json` for machine-readable output. JSON mode
+also suppresses the interactive picker, so it's safe to drive atr from a
+non-interactive agent loop:
+
+```bash
+# list all root conversations in a project (one entry per parentUuid:null prompt)
+atr -p ~/path roots --json
+
+# enumerate every node in a specific root's subtree
+atr -p ~/path -r 79c67796 list --json
+
+# only the abandoned/active leaves of a subtree
+atr -p ~/path -r 79c67796 leaves --json
+
+# search across all prompts in the project (or scope with -r)
+atr -p ~/path search "playwright" --json
+
+# whole-project tree as nested JSON
+atr -p ~/path tree --json
+
+# look up one node
+atr -p ~/path info 79c67796 --json
+
+# generate the synthetic-session `claude --resume <new-sid>` command for any node
+atr -p ~/path resume 79c67796 --json
+# {"target_uuid": "...", "session_id": "<new>", "file": "...", "command": "...", "chain_length": 1386}
+```
+
+Errors in `--json` mode are emitted as `{"error": "...", ...}` to stdout
+with exit code 2; otherwise they go to stderr with the same exit code.
+
 In the interactive menus, `↑/↓` move, `Enter` selects, `1-9` jumps + confirms,
 and `q` / `Esc` quits. Both menus are pure ANSI — no curses, no alt-screen,
 no extra deps.
