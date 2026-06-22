@@ -22,9 +22,58 @@ import subprocess
 import sys
 import unicodedata
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    import tomllib  # 3.11+ stdlib
+except ImportError:  # pragma: no cover  -- 3.10 fallback
+    tomllib = None  # type: ignore[assignment]
+
+
+# ---------- config ----------
+
+_CONFIG_DEFAULTS: Dict[str, Any] = {
+    "page_size": 15,
+    "paths": {"claude_projects_dir": "~/.claude/projects"},
+    "browser": {"default_view": "tree", "tree_order": "oldest_first"},
+    "debug": {"log_keys": False},
+}
+
+
+def _load_config() -> Dict[str, Any]:
+    """Read cli/atr.toml next to this script. Missing keys fall through to
+    _CONFIG_DEFAULTS so older configs still work after we add fields."""
+    cfg_path = Path(__file__).parent / "atr.toml"
+    if tomllib is None or not cfg_path.exists():
+        return _CONFIG_DEFAULTS
+    try:
+        with cfg_path.open("rb") as f:
+            user = tomllib.load(f)
+    except Exception:  # noqa: BLE001  -- never crash on a malformed config
+        return _CONFIG_DEFAULTS
+    # Shallow-merge per section so a partial user config still inherits defaults.
+    merged: Dict[str, Any] = dict(_CONFIG_DEFAULTS)
+    for k, v in user.items():
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            merged[k] = {**merged[k], **v}
+        else:
+            merged[k] = v
+    return merged
+
+
+_CONFIG = _load_config()
+
+
+def _cfg(*keys: str, default: Any = None) -> Any:
+    """Walk into _CONFIG by section + key. _cfg('browser', 'tree_order')."""
+    cur: Any = _CONFIG
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -57,8 +106,10 @@ def _truncate_w(s: str, max_w: int, ellipsis: str = "…") -> str:
 
 
 CLAUDE_PROJECTS_DIR = Path(
-    os.environ.get("CLAUDE_PROJECTS_DIR", Path.home() / ".claude" / "projects")
-)
+    os.environ.get("CLAUDE_PROJECTS_DIR")
+    or os.path.expanduser(_cfg("paths", "claude_projects_dir",
+                               default="~/.claude/projects"))
+).expanduser()
 
 
 # Sentinel returned by pickers when the user wants to back up one layer.
@@ -192,6 +243,8 @@ def build_nodes(
             "timestamp": m.get("timestamp") or "",
             "session_id": m.get("sessionId") or "",
             "cwd": m.get("cwd") or "",
+            # session id whose stock --resume natively lands here (None if not native)
+            "native_session_id": None,
         }
     for u, n in nodes.items():
         if n["parent"] and n["parent"] in nodes:
@@ -199,7 +252,7 @@ def build_nodes(
 
     # native_reachable: set of user-prompt uuids that --resume <sid> physically lands on
     native_reachable: set = set()
-    for _sid, leaf in session_leaf.items():
+    for sid, leaf in session_leaf.items():
         cur = leaf
         seen: set = set()
         while cur and cur not in seen:
@@ -209,6 +262,8 @@ def build_nodes(
                 break
             if _is_user_prompt(m[0]):
                 native_reachable.add(cur)
+                if cur in nodes and nodes[cur]["native_session_id"] is None:
+                    nodes[cur]["native_session_id"] = sid
                 break
             cur = m[0].get("parentUuid")
 
@@ -266,6 +321,25 @@ def write_synthetic_session(project_dir: Path, target_uuid: str,
 
 def emit_resume(project_dir: Path, node: dict, by_uuid: Dict[str, Tuple[dict, str]],
                 exec_after: bool) -> None:
+    # Native shortcut: when this node is the leafUuid resolution of some session
+    # that already exists on disk, stock `claude --resume <that-session>` lands
+    # exactly here. No need to write a synthetic file.
+    native_sid = node.get("native_session_id") if isinstance(node, dict) else None
+    if native_sid:
+        cmd_str = f"claude --resume {native_sid}"
+        print()
+        print(green(f"  ✓ native resume target — using original session, no file written"))
+        print(bold(f"  $ {cmd_str}"))
+        print()
+        if exec_after:
+            print(dim("  → exec…"))
+            try:
+                os.execvp("claude", ["claude", "--resume", native_sid])
+            except FileNotFoundError:
+                print(red("  ! `claude` not found — install Claude Code CLI and put it on PATH"))
+                sys.exit(2)
+        return
+
     new_sid, chain_len, new_path = write_synthetic_session(project_dir, node["uuid"], by_uuid)
     cmd_str = f"claude --resume {new_sid}"
     print()
@@ -291,6 +365,40 @@ def _format_time(ts: str) -> str:
         return dt.strftime("%m-%d %H:%M")
     except ValueError:
         return ts[:16]
+
+
+def _format_relative(ts: str) -> str:
+    """Claude Code-style "21 minutes ago" / "1 week ago" rendering."""
+    if not ts:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return ts[:16]
+    now = datetime.now(timezone.utc)
+    secs = int((now - dt).total_seconds())
+    if secs < 0:
+        secs = 0
+    if secs < 60:
+        n = secs
+        return f"{n} second{'s' if n != 1 else ''} ago"
+    mins = secs // 60
+    if mins < 60:
+        return f"{mins} minute{'s' if mins != 1 else ''} ago"
+    hours = mins // 60
+    if hours < 24:
+        return f"{hours} hour{'s' if hours != 1 else ''} ago"
+    days = hours // 24
+    if days < 7:
+        return f"{days} day{'s' if days != 1 else ''} ago"
+    weeks = days // 7
+    if weeks < 5:
+        return f"{weeks} week{'s' if weeks != 1 else ''} ago"
+    months = days // 30
+    if months < 12:
+        return f"{months} month{'s' if months != 1 else ''} ago"
+    years = days // 365
+    return f"{years} year{'s' if years != 1 else ''} ago"
 
 
 def _highlight(text: str, query: str) -> str:
@@ -430,23 +538,26 @@ def with_pager(render_fn) -> str:
     return text
 
 
-_NODE_PAGE = 10
+_NODE_PAGE = int(_cfg("page_size", default=15))
 _VIEW_CYCLE = ("tree", "list", "leaves")
 
 
-def _flatten_tree(roots: List[str], nodes: Dict[str, dict]) -> List[Tuple[str, str, str, bool]]:
+def _flatten_tree(roots: List[str], nodes: Dict[str, dict],
+                  reverse: bool = False) -> List[Tuple[str, str, str, bool]]:
     """Iterative depth-first walk that mirrors render_tree's compact collapsing.
 
     Yields (uuid_or_None, prefix, branch_glyph, is_last). When uuid is None the
     entry is the "⋮ N hidden" filler — not selectable. Linear single-child runs
     are collapsed so a 1700-node tree renders in a screenful of structural rows.
+
+    `reverse=True` sorts sibling sets newest-first instead of oldest-first.
     """
     out: List[Tuple[Optional[str], str, str, bool]] = []
 
     def sort_key(uid: str) -> str:
         return nodes[uid]["timestamp"] or ""
 
-    roots_sorted = sorted(roots, key=sort_key)
+    roots_sorted = sorted(roots, key=sort_key, reverse=reverse)
     for ri, root in enumerate(roots_sorted):
         if ri > 0:
             out.append((None, "", "", True))  # blank separator between roots
@@ -476,7 +587,7 @@ def _flatten_tree(roots: List[str], nodes: Dict[str, dict]) -> List[Tuple[str, s
                 out.append((None, cont_prefix, f"⋮ ({run_len - 2} hidden)", True))
                 out.append((tail, cont_prefix, "└─ ", True))
 
-            tail_children = sorted(nodes[tail]["children"], key=sort_key)
+            tail_children = sorted(nodes[tail]["children"], key=sort_key, reverse=reverse)
             child_prefix = cont_prefix + ("   " if run_len > 1 else "")
             n_kids = len(tail_children)
             for i in range(n_kids - 1, -1, -1):
@@ -519,7 +630,11 @@ def _browse_render(state: dict, items: List[dict], all_nodes: Dict[str, dict],
         else:
             tabs.append(dim(f" {v} "))
     lines.append("  " + "  ".join(tabs) + dim("   (⇥ next view)"))
-    lines.append(dim("  ↑↓ move · ⏎ resume · ⌫ erase · ⎋ back · ^C quit"))
+    if view == "tree":
+        order_hint = " · ^R flip"
+    else:
+        order_hint = ""
+    lines.append(dim(f"  ↑↓ move · ⏎ resume{order_hint} · ⎋ back · ^C quit"))
     lines.append("")
 
     if not items:
@@ -609,7 +724,7 @@ def _compute_browse_items(state: dict, all_nodes: Dict[str, dict]) -> List:
     if view == "tree":
         roots = [u for u, n in all_nodes.items()
                  if not (n["parent"] and n["parent"] in all_nodes)]
-        flat = _flatten_tree(roots, all_nodes)
+        flat = _flatten_tree(roots, all_nodes, reverse=state.get("tree_reverse", False))
         items = []
         for uuid_, prefix, glyph, _is_last in flat:
             items.append({
@@ -646,10 +761,11 @@ def browse_project(project_dir: Path, all_nodes: Dict[str, dict], native: set,
         return None
 
     state = {
-        "view": "tree",
+        "view": _cfg("browser", "default_view", default="tree"),
         "search": "",
         "selected": 0,
         "offset": 0,
+        "tree_reverse": _cfg("browser", "tree_order", default="oldest_first") == "newest_first",
     }
 
     items = _compute_browse_items(state, all_nodes)
@@ -687,6 +803,10 @@ def browse_project(project_dir: Path, all_nodes: Dict[str, dict], native: set,
                 idx = _VIEW_CYCLE.index(state["view"])
                 state["view"] = _VIEW_CYCLE[(idx - 1) % len(_VIEW_CYCLE)]
                 refresh()
+            elif key == "\x12":  # Ctrl+R — flip tree order (only meaningful in tree view)
+                if state["view"] == "tree":
+                    state["tree_reverse"] = not state["tree_reverse"]
+                    refresh()
             elif key == "esc":
                 if state["search"]:
                     state["search"] = ""
@@ -887,6 +1007,34 @@ def cmd_resume(args) -> None:
         if not getattr(args, "json", False):
             print(yellow(f"⚠ {target[:8]} is not a user prompt ({by_uuid[target][0].get('type')}) — trying anyway"), file=sys.stderr)
 
+    # Native shortcut: stock --resume already lands here, skip synthesis.
+    native_sid = node.get("native_session_id") if isinstance(node, dict) else None
+    if native_sid:
+        cmd_str = f"claude --resume {native_sid}"
+        if getattr(args, "json", False):
+            _emit_json({
+                "target_uuid": target,
+                "target_text": node.get("text", ""),
+                "session_id": native_sid,
+                "file": None,
+                "synthesized": False,
+                "command": cmd_str,
+            })
+        else:
+            print()
+            print(green(f"  ✓ native resume target — using original session, no file written"))
+            print(bold(f"  $ {cmd_str}"))
+            print()
+        if args.exec_:
+            if not getattr(args, "json", False):
+                print(dim("  → exec…"))
+            try:
+                os.execvp("claude", ["claude", "--resume", native_sid])
+            except FileNotFoundError:
+                print(red("  ! `claude` not found — install Claude Code CLI and put it on PATH"))
+                sys.exit(2)
+        return
+
     new_sid, chain_len, new_path = write_synthetic_session(pd, target, by_uuid)
     cmd_str = f"claude --resume {new_sid}"
     if getattr(args, "json", False):
@@ -895,6 +1043,7 @@ def cmd_resume(args) -> None:
             "target_text": node.get("text", ""),
             "session_id": new_sid,
             "file": str(new_path),
+            "synthesized": True,
             "chain_length": chain_len,
             "command": cmd_str,
         })
@@ -962,7 +1111,9 @@ def cmd_roots(args) -> None:
                     "node_count": r["node_count"],
                     "native_at_root": r["native_at_root"],
                     "native_in_subtree": r["native_in_subtree"],
-                    "text": r["title"],
+                    "text": r["title"],               # latest prompt in subtree
+                    "root_text": r["root_text"],      # original parentUuid:null prompt
+                    "latest_uuid": r["latest_uuid"],  # uuid of the latest node
                 }
                 for r in roots
             ],
@@ -973,15 +1124,11 @@ def cmd_roots(args) -> None:
     print()
     for i, r in enumerate(roots, 1):
         nat = purple("★ ") if r["native_at_root"] else "  "
-        ts = "—"
-        if r["last_active"]:
-            try:
-                ts = datetime.fromisoformat(r["last_active"].replace("Z", "+00:00")).astimezone().strftime("%m-%d %H:%M")
-            except ValueError:
-                ts = r["last_active"][:11]
+        ts = _format_relative(r["last_active"])
         title = re.sub(r"\s+", " ", r["title"]).strip()
-        nodes_str = f"{r['node_count']:>4}n"
-        print(f"  {i:>3}. {nat}{dim(r['root_uuid'][:8])}  {dim(ts)}  "
+        nodes_label = "node " if r["node_count"] == 1 else "nodes"
+        nodes_str = f"{r['node_count']:>4} {nodes_label}"
+        print(f"  {i:>3}. {nat}{dim(r['root_uuid'][:8])}  {dim(ts):<14}  "
               f"{dim(nodes_str)}  {title[:100]}")
 
 
@@ -1218,14 +1365,19 @@ def _scan_roots(base_path: str, all_projects: bool = False) -> Tuple[List[dict],
             if n["parent"] is not None:
                 continue
             sub = _subtree(uuid_, nodes)
-            timestamps = [nodes[u]["timestamp"] for u in sub if nodes[u]["timestamp"]]
-            last_ts = max(timestamps, default=n["timestamp"] or "")
+            # Pick the node with the latest timestamp as the "title" — it's the
+            # most recently typed prompt in this conversation and is far more
+            # useful to identify "where I left off" than the original root.
+            latest_uuid = max(sub, key=lambda u: nodes[u]["timestamp"] or "")
+            last_ts = nodes[latest_uuid]["timestamp"] or n["timestamp"] or ""
             roots.append({
                 "root_uuid": uuid_,
                 "project_dir": str(d),
                 "cwd": real_cwd,
                 "slug": d.name,
-                "title": n["text"],
+                "title": nodes[latest_uuid]["text"],
+                "root_text": n["text"],
+                "latest_uuid": latest_uuid,
                 "first_seen": n["timestamp"] or "",
                 "last_active": last_ts,
                 "node_count": len(sub),
@@ -1237,7 +1389,7 @@ def _scan_roots(base_path: str, all_projects: bool = False) -> Tuple[List[dict],
     return roots, scope
 
 
-_PROJECT_PAGE = 12
+_PROJECT_PAGE = int(_cfg("page_size", default=15))
 
 
 def _root_render(roots: List[dict], selected: int, offset: int,
@@ -1245,9 +1397,14 @@ def _root_render(roots: List[dict], selected: int, offset: int,
     cols = shutil.get_terminal_size((140, 24)).columns
     visible = roots[offset:offset + _PROJECT_PAGE]
     num_w = max(2, len(str(len(roots))))
-    max_n_w = max((len(str(r["node_count"])) for r in roots), default=1) + 1
-    # fixed prefix width (display cells): "  ▶ NN. ★ MM-DD HH:MM  NNNn  "
-    head_w = 2 + 2 + (num_w + 1) + 1 + 1 + 1 + 11 + 2 + max_n_w + 2
+    max_n_w = max((len(str(r["node_count"])) for r in roots), default=1)
+    # Pre-compute the relative-time column width across the visible page so the
+    # node-count + title columns stay aligned even as the strings vary.
+    ts_strs = [(_format_relative(r["last_active"]) if r["last_active"] else "—")
+               for r in visible]
+    ts_w = max((_vwidth(s) for s in ts_strs), default=8)
+    nodes_w = max_n_w + len(" nodes")  # always pad to plural form for alignment
+    head_w = 2 + 2 + (num_w + 1) + 1 + 1 + 1 + ts_w + 2 + nodes_w + 2
     dir_w = 18 if show_dir else 0
     title_w = max(15, cols - head_w - dir_w - 2)
     scope = _truncate_w(scope_note, cols - 9)  # "  scope: " is 9 cells
@@ -1261,13 +1418,10 @@ def _root_render(roots: List[dict], selected: int, offset: int,
         abs_idx = offset + i
         num_str = f"{abs_idx + 1:>{num_w}}."
         nat = purple("★") if r["native_at_root"] else " "
-        ts = "—"
-        if r["last_active"]:
-            try:
-                ts = datetime.fromisoformat(r["last_active"].replace("Z", "+00:00")).astimezone().strftime("%m-%d %H:%M")
-            except ValueError:
-                ts = r["last_active"][:11]
-        nodes_str = f"{r['node_count']:>{max_n_w - 1}}n"
+        ts_raw = ts_strs[i]
+        ts_padded = ts_raw + " " * max(0, ts_w - _vwidth(ts_raw))
+        nodes_label = "node " if r["node_count"] == 1 else "nodes"
+        nodes_raw = f"{r['node_count']:>{max_n_w}} {nodes_label}"
         title = _truncate_w(re.sub(r"\s+", " ", r["title"]).strip(), title_w)
         dir_str = ""
         if show_dir:
@@ -1276,11 +1430,11 @@ def _root_render(roots: List[dict], selected: int, offset: int,
             dir_str = dim(short) + " " * max(0, dir_w - _vwidth(short)) + "  "
         if abs_idx == selected:
             arrow = green("▶")
-            row = (f"  {arrow} {bold(num_str)} {nat} {dim(ts)}  {dim(nodes_str)}  "
-                   f"{dir_str}{bold(title)}")
+            row = (f"  {arrow} {bold(num_str)} {nat} {dim(ts_padded)}  "
+                   f"{dim(nodes_raw)}  {dir_str}{bold(title)}")
         else:
-            row = (f"    {dim(num_str)} {nat} {dim(ts)}  {dim(nodes_str)}  "
-                   f"{dir_str}{title}")
+            row = (f"    {dim(num_str)} {nat} {dim(ts_padded)}  "
+                   f"{dim(nodes_raw)}  {dir_str}{title}")
         lines.append(row)
     if len(roots) > _PROJECT_PAGE:
         lines.append(dim(f"    … showing {offset + 1}-{offset + len(visible)} of {len(roots)}"))
@@ -1385,7 +1539,8 @@ class _RawInput:
         self.fd = sys.stdin.fileno()
         self.old = termios.tcgetattr(self.fd)
         tty.setcbreak(self.fd)
-        self.log = os.environ.get("ATR_DEBUG_KEYS") == "1"
+        self.log = (os.environ.get("ATR_DEBUG_KEYS") == "1"
+                    or bool(_cfg("debug", "log_keys", default=False)))
 
     def close(self) -> None:
         import termios

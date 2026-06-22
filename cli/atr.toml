@@ -1,0 +1,30 @@
+# atr — agent tree resume CLI configuration
+# Lives next to atr.py. Edit and restart atr to apply changes.
+# Environment variables (CLAUDE_PROJECTS_DIR, ATR_DEBUG_KEYS, NO_COLOR) still override these.
+
+
+# Rows shown per page in any paginated view (project picker, node list, tree).
+page_size = 15
+
+
+[paths]
+
+# Where Claude Code stores its conversation jsonl files.
+claude_projects_dir = "~/.claude/projects"
+
+
+[browser]
+
+# Initial view when entering the browser. One of: "tree" | "list" | "leaves".
+default_view = "tree"
+
+# Default tree sort order. One of: "oldest_first" | "newest_first".
+# Inside the browser, press Ctrl+R to flip between the two at runtime.
+tree_order = "oldest_first"
+
+
+[debug]
+
+# Log every keypress (raw bytes) to stderr — useful when arrow keys misbehave.
+# The env var ATR_DEBUG_KEYS=1 also turns this on.
+log_keys = false
