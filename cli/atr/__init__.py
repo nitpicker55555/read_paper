@@ -1033,14 +1033,41 @@ def _flatten_tree(roots: List[str], nodes: Dict[str, dict],
     entry is the "⋮ N hidden" filler — not selectable. Linear single-child runs
     are collapsed so a 1700-node tree renders in a screenful of structural rows.
 
-    `reverse=True` sorts sibling sets newest-first instead of oldest-first.
+    `reverse=False`: classic top-down view, sibling sets oldest-first.
+
+    `reverse=True`: sibling sets are sorted by the **latest timestamp anywhere
+    in their subtree**, ascending — so the subtree containing the absolute
+    newest leaf is visited LAST in the DFS. Callers reverse the returned list
+    afterwards to put that newest leaf at the top of the screen with the root
+    at the bottom; sorting by subtree-max-ts means "newest" wins over "deepest".
     """
     out: List[Tuple[Optional[str], str, str, bool]] = []
 
-    def sort_key(uid: str) -> str:
-        return nodes[uid]["timestamp"] or ""
+    if reverse:
+        # Iterative post-order so we don't hit recursion limit on deep trees.
+        subtree_max: Dict[str, str] = {}
+        post_stack: List[Tuple[str, bool]] = [(r, False) for r in roots]
+        while post_stack:
+            uid, done = post_stack.pop()
+            if done:
+                best = nodes[uid]["timestamp"] or ""
+                for c in nodes[uid]["children"]:
+                    cm = subtree_max.get(c, "")
+                    if cm > best:
+                        best = cm
+                subtree_max[uid] = best
+            else:
+                post_stack.append((uid, True))
+                for c in nodes[uid]["children"]:
+                    post_stack.append((c, False))
 
-    roots_sorted = sorted(roots, key=sort_key, reverse=reverse)
+        def sort_key(uid: str) -> str:
+            return subtree_max.get(uid, nodes[uid]["timestamp"] or "")
+    else:
+        def sort_key(uid: str) -> str:
+            return nodes[uid]["timestamp"] or ""
+
+    roots_sorted = sorted(roots, key=sort_key)
     for ri, root in enumerate(roots_sorted):
         if ri > 0:
             out.append((None, "", "", True))  # blank separator between roots
@@ -1070,7 +1097,7 @@ def _flatten_tree(roots: List[str], nodes: Dict[str, dict],
                 out.append((None, cont_prefix, f"⋮ ({run_len - 2} hidden)", True))
                 out.append((tail, cont_prefix, "└─ ", True))
 
-            tail_children = sorted(nodes[tail]["children"], key=sort_key, reverse=reverse)
+            tail_children = sorted(nodes[tail]["children"], key=sort_key)
             child_prefix = cont_prefix + ("   " if run_len > 1 else "")
             n_kids = len(tail_children)
             for i in range(n_kids - 1, -1, -1):
@@ -1220,7 +1247,12 @@ def _compute_browse_items(state: dict, all_nodes: Dict[str, dict]) -> List:
     if view == "tree":
         roots = [u for u, n in all_nodes.items()
                  if not (n["parent"] and n["parent"] in all_nodes)]
-        flat = _flatten_tree(roots, all_nodes, reverse=state.get("tree_reverse", False))
+        reverse = state.get("tree_reverse", False)
+        flat = _flatten_tree(roots, all_nodes, reverse=reverse)
+        if reverse:
+            # Flip the whole list so the newest leaf — the last node visited
+            # by the subtree-max-ts ordered DFS — lands at the top.
+            flat = list(reversed(flat))
         items = []
         for uuid_, prefix, glyph, _is_last in flat:
             items.append({
