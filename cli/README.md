@@ -25,7 +25,7 @@ pip install ./cli
 pip install -e ./cli
 
 # from GitHub without cloning
-pip install "git+https://github.com/nitpicker55555/read_paper#subdirectory=cli"
+pip install "git+https://github.com/nitpicker55555/Agent-Treeflow"
 
 # globally, in an isolated environment (recommended for a personal tool)
 pipx install ./cli

@@ -35,9 +35,9 @@ atr = "atr:main"
 
 
 [project.urls]
-Homepage = "https://github.com/nitpicker55555/read_paper"
-Repository = "https://github.com/nitpicker55555/read_paper"
-Issues = "https://github.com/nitpicker55555/read_paper/issues"
+Homepage = "https://github.com/nitpicker55555/Agent-Treeflow"
+Repository = "https://github.com/nitpicker55555/Agent-Treeflow"
+Issues = "https://github.com/nitpicker55555/Agent-Treeflow/issues"
 
 
 [tool.setuptools]
