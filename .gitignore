@@ -9,3 +9,7 @@ instance/
 .env.local
 .env.*.local
 cli/__pycache__/
+cli/atr/__pycache__/
+cli/*.egg-info/
+cli/build/
+cli/dist/

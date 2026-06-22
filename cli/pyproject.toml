@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "agent-tree-resume"
+version = "0.1.0"
+description = "Browse and resume any node in your local Claude Code conversation tree — including the abandoned sibling branches that stock `claude --resume` can't reach."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "puzhen" }]
+requires-python = ">=3.11"
+keywords = ["claude", "claude-code", "cli", "resume", "session", "tree", "tui"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: User Interfaces",
+    "Topic :: Terminals",
+]
+# No third-party deps — pure stdlib (tomllib is stdlib in 3.11+).
+dependencies = []
+
+
+[project.scripts]
+atr = "atr:main"
+
+
+[project.urls]
+Homepage = "https://github.com/nitpicker55555/read_paper"
+Repository = "https://github.com/nitpicker55555/read_paper"
+Issues = "https://github.com/nitpicker55555/read_paper/issues"
+
+
+[tool.setuptools]
+packages = ["atr"]
+
+# Bundle the default config TOML next to the installed module so _load_config
+# can find it at runtime via Path(__file__).parent / "atr.toml".
+[tool.setuptools.package-data]
+atr = ["atr.toml"]

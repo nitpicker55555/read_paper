@@ -13,18 +13,37 @@ loads that file and lands exactly there.
 ## Install
 
 ```bash
-# from the project root
-chmod +x cli/atr.py
+# from a clone of the repo, install the package
+pip install ./cli
 
-# put it on PATH (any one of these)
-sudo ln -s "$PWD/cli/atr.py" /usr/local/bin/atr
-# or
-ln -s "$PWD/cli/atr.py" ~/.local/bin/atr
-# or just alias in ~/.zshrc
-echo "alias atr=\"$PWD/cli/atr.py\"" >> ~/.zshrc
+# editable install (changes to cli/atr/ take effect immediately)
+pip install -e ./cli
+
+# from GitHub without cloning
+pip install "git+https://github.com/nitpicker55555/read_paper#subdirectory=cli"
+
+# globally, in an isolated environment (recommended for a personal tool)
+pipx install ./cli
 ```
 
-No deps — pure Python 3.9+ stdlib.
+After installation the `atr` command is on PATH. `python -m atr` is equivalent.
+
+Pure Python 3.11+ stdlib — no third-party dependencies. (3.11 is the floor
+because `tomllib` is used for config parsing.)
+
+### User-level config
+
+The package ships `atr.toml` next to the code with sensible defaults
+(page size, default view, tree order, etc.). To override a setting without
+editing the installed file, create one of these — keys missing here fall
+back to the bundled defaults:
+
+```
+~/.config/atr/atr.toml     # XDG-style, preferred
+~/.atr.toml                # also recognized
+```
+
+`ATR_CONFIG=/path/to/atr.toml` env var also works.
 
 ## Use
 

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """agent tree resume — browse and resume any node in your local Claude Code
 conversation tree, including abandoned sibling branches that `claude --resume`
 can't reach natively.
@@ -43,23 +42,39 @@ _CONFIG_DEFAULTS: Dict[str, Any] = {
 
 
 def _load_config() -> Dict[str, Any]:
-    """Read cli/atr.toml next to this script. Missing keys fall through to
-    _CONFIG_DEFAULTS so older configs still work after we add fields."""
-    cfg_path = Path(__file__).parent / "atr.toml"
-    if tomllib is None or not cfg_path.exists():
-        return _CONFIG_DEFAULTS
-    try:
-        with cfg_path.open("rb") as f:
-            user = tomllib.load(f)
-    except Exception:  # noqa: BLE001  -- never crash on a malformed config
-        return _CONFIG_DEFAULTS
-    # Shallow-merge per section so a partial user config still inherits defaults.
-    merged: Dict[str, Any] = dict(_CONFIG_DEFAULTS)
-    for k, v in user.items():
-        if isinstance(v, dict) and isinstance(merged.get(k), dict):
-            merged[k] = {**merged[k], **v}
-        else:
-            merged[k] = v
+    """Layer config: in-code defaults → bundled atr.toml → user override.
+
+    User override paths (first that exists wins, after defaults+bundled):
+      $ATR_CONFIG    — explicit path, if set
+      ~/.config/atr/atr.toml
+      ~/.atr.toml
+
+    Missing keys at any layer fall through to the previous layer, so old
+    user configs keep working after we add fields."""
+    candidates: List[Path] = [Path(__file__).parent / "atr.toml"]
+    env_override = os.environ.get("ATR_CONFIG")
+    if env_override:
+        candidates.append(Path(env_override).expanduser())
+    candidates.append(Path.home() / ".config" / "atr" / "atr.toml")
+    candidates.append(Path.home() / ".atr.toml")
+
+    merged: Dict[str, Any] = {k: (dict(v) if isinstance(v, dict) else v)
+                              for k, v in _CONFIG_DEFAULTS.items()}
+    if tomllib is None:
+        return merged
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            with path.open("rb") as f:
+                data = tomllib.load(f)
+        except Exception:  # noqa: BLE001  -- malformed config never crashes atr
+            continue
+        for k, v in data.items():
+            if isinstance(v, dict) and isinstance(merged.get(k), dict):
+                merged[k] = {**merged[k], **v}
+            else:
+                merged[k] = v
     return merged
 
 
@@ -245,10 +260,39 @@ def build_nodes(
             "cwd": m.get("cwd") or "",
             # session id whose stock --resume natively lands here (None if not native)
             "native_session_id": None,
+            # assistant reply text whose nearest user-prompt ancestor is this node;
+            # populated in the answer-aggregation pass below. Used by the browser's
+            # "search prompts + replies" mode.
+            "answer_text": "",
         }
     for u, n in nodes.items():
         if n["parent"] and n["parent"] in nodes:
             nodes[n["parent"]]["children"].append(u)
+
+    # Aggregate assistant text per user node so the browser can search replies
+    # too. For each non-user msg, walk up parentUuid until we hit a user prompt
+    # ancestor — that node "owns" the reply. Done in one pass over by_uuid.
+    answer_buf: Dict[str, List[str]] = {u: [] for u in user_uuids}
+    for uid, (msg, _line) in by_uuid.items():
+        if _is_user_prompt(msg):
+            continue
+        if msg.get("type") != "assistant":
+            continue
+        owner = find_user_parent(uid)
+        if not owner or owner not in answer_buf:
+            continue
+        content = (msg.get("message") or {}).get("content")
+        if isinstance(content, str) and content.strip():
+            answer_buf[owner].append(content.strip())
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    t = str(block.get("text") or "").strip()
+                    if t:
+                        answer_buf[owner].append(t)
+    for u, parts in answer_buf.items():
+        if parts:
+            nodes[u]["answer_text"] = "\n".join(parts)
 
     # native_reachable: set of user-prompt uuids that --resume <sid> physically lands on
     native_reachable: set = set()
@@ -619,9 +663,11 @@ def _browse_render(state: dict, items: List[dict], all_nodes: Dict[str, dict],
     # search bar — always visible, cursor block at end
     cursor = green("▌")
     search_show = search if search else dim("(type to filter)")
+    scope = state.get("search_scope", "prompts")
+    scope_label = "in prompts" if scope == "prompts" else "in prompts + replies"
     lines.append("")
-    lines.append(f"  {bold('search:')} {search_show}{cursor}  "
-                 + dim(f" ({len(items)} match)" if search else f" ({len(items)} total)"))
+    count_part = f" ({len(items)} match · {scope_label})" if search else f" ({len(items)} total · {scope_label})"
+    lines.append(f"  {bold('search:')} {search_show}{cursor}  " + dim(count_part))
     # view tabs
     tabs = []
     for v in _VIEW_CYCLE:
@@ -630,11 +676,12 @@ def _browse_render(state: dict, items: List[dict], all_nodes: Dict[str, dict],
         else:
             tabs.append(dim(f" {v} "))
     lines.append("  " + "  ".join(tabs) + dim("   (⇥ next view)"))
+    extras = []
     if view == "tree":
-        order_hint = " · ^R flip"
-    else:
-        order_hint = ""
-    lines.append(dim(f"  ↑↓ move · ⏎ resume{order_hint} · ⎋ back · ^C quit"))
+        extras.append("^R flip")
+    extras.append("^A scope")
+    extras_hint = " · " + " · ".join(extras) if extras else ""
+    lines.append(dim(f"  ↑↓ move · ⏎ resume{extras_hint} · ⎋ back · ^C quit"))
     lines.append("")
 
     if not items:
@@ -720,6 +767,16 @@ def _compute_browse_items(state: dict, all_nodes: Dict[str, dict]) -> List:
     are raw node dicts. Selection indexes into the returned list."""
     view = state["view"]
     search = state["search"].lower()
+    scope = state.get("search_scope", "prompts")  # "prompts" | "all"
+
+    def node_matches(n: dict) -> bool:
+        if not search:
+            return True
+        if search in (n["text"] or "").lower():
+            return True
+        if scope == "all" and search in (n.get("answer_text") or "").lower():
+            return True
+        return False
 
     if view == "tree":
         roots = [u for u, n in all_nodes.items()
@@ -735,11 +792,8 @@ def _compute_browse_items(state: dict, all_nodes: Dict[str, dict]) -> List:
                 "filler": uuid_ is None,
             })
         if search:
-            # In tree view, keep structural parents so the matching nodes still
-            # show in context. Simple heuristic: include any line whose node
-            # text matches (filler entries are removed when searching).
             items = [it for it in items
-                     if (not it["filler"]) and search in (it["node"]["text"] or "").lower()]
+                     if (not it["filler"]) and node_matches(it["node"])]
         return items
 
     if view == "leaves":
@@ -748,7 +802,7 @@ def _compute_browse_items(state: dict, all_nodes: Dict[str, dict]) -> List:
         nodes_list = list(all_nodes.values())
     nodes_list.sort(key=lambda n: n["timestamp"] or "", reverse=True)
     if search:
-        nodes_list = [n for n in nodes_list if search in (n["text"] or "").lower()]
+        nodes_list = [n for n in nodes_list if node_matches(n)]
     return nodes_list
 
 
@@ -763,6 +817,7 @@ def browse_project(project_dir: Path, all_nodes: Dict[str, dict], native: set,
     state = {
         "view": _cfg("browser", "default_view", default="tree"),
         "search": "",
+        "search_scope": "prompts",  # "prompts" | "all" (prompts + assistant replies)
         "selected": 0,
         "offset": 0,
         "tree_reverse": _cfg("browser", "tree_order", default="oldest_first") == "newest_first",
@@ -807,6 +862,9 @@ def browse_project(project_dir: Path, all_nodes: Dict[str, dict], native: set,
                 if state["view"] == "tree":
                     state["tree_reverse"] = not state["tree_reverse"]
                     refresh()
+            elif key == "\x01":  # Ctrl+A — toggle search scope (prompts ↔ prompts+replies)
+                state["search_scope"] = "all" if state["search_scope"] == "prompts" else "prompts"
+                refresh(keep_selection=True)
             elif key == "esc":
                 if state["search"]:
                     state["search"] = ""
