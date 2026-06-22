@@ -31,6 +31,10 @@ default_view = "tree"
 # Inside the browser, press Ctrl+R to flip between the two at runtime.
 tree_order = "oldest_first"
 
+# Auto-exec the agent CLI after you pick a node, instead of just printing
+# the resume command. Equivalent to passing `-x` / `--exec` every time.
+auto_exec = false
+
 
 [debug]
 

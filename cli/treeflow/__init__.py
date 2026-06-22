@@ -40,7 +40,14 @@ _CONFIG_DEFAULTS: Dict[str, Any] = {
         "claude_projects_dir": "~/.claude/projects",
         "codex_sessions_dir": "~/.codex/sessions",
     },
-    "browser": {"default_view": "tree", "tree_order": "oldest_first"},
+    "browser": {
+        "default_view": "tree",
+        "tree_order": "oldest_first",
+        # When true, picking a node in the interactive browser immediately
+        # execs the agent CLI on the resume target instead of just printing
+        # the command. Same as passing `-x` / `--exec` at the top level.
+        "auto_exec": False,
+    },
     "debug": {"log_keys": False},
 }
 
@@ -1758,6 +1765,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("-a", "--all", action="store_true", dest="all_projects",
                     help="include roots from every project dir, "
                          "not just the one matching cwd")
+    ap.add_argument("-x", "--exec", action="store_true", dest="exec_",
+                    help="after picking a node (or resolving `resume`), "
+                         "exec the agent CLI on the resume target instead of "
+                         "just printing the command")
     tool_group = ap.add_mutually_exclusive_group()
     tool_group.add_argument("--tool", default=None, choices=sorted(_DRIVERS),
                             help="which agent CLI to target (default from config)")
@@ -1796,7 +1807,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_resume = sub.add_parser("resume", aliases=["r"], help="generate resume command for a uuid prefix")
     p_resume.add_argument("uuid")
-    p_resume.add_argument("-x", "--exec", action="store_true", dest="exec_")
+    # Subparser-level `-x` keeps working for back-compat (`treeflow resume <uuid> -x`).
+    # Use SUPPRESS so the top-level value persists when -x is only at the top.
+    p_resume.add_argument("-x", "--exec", action="store_true", dest="exec_",
+                          default=argparse.SUPPRESS)
     _add_json_flag(p_resume)
     p_resume.set_defaults(func=cmd_resume)
 
@@ -2228,8 +2242,12 @@ def main(argv: Optional[List[str]] = None) -> None:
                 chosen_root = None
                 layer = "project"
                 continue
-            # result is a node dict — resume it via the driver
-            driver.emit_resume(pd, result, raw, exec_after=False)
+            # result is a node dict — resume it via the driver. Auto-exec the
+            # agent CLI if the user passed `-x` at the top level OR set
+            # `auto_exec = true` under `[browser]` in their config.
+            auto_exec = bool(getattr(args, "exec_", False)) or bool(
+                _cfg("browser", "auto_exec", default=False))
+            driver.emit_resume(pd, result, raw, exec_after=auto_exec)
             return
 
 
