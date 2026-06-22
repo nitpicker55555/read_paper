@@ -421,26 +421,119 @@ def with_pager(render_fn) -> str:
     return text
 
 
-def pick_interactive(items: List[dict]) -> Optional[dict]:
-    if not items:
+_NODE_PAGE = 10
+
+
+def _pick_node_render(items: List[dict], native_reachable: set, selected: int,
+                      offset: int, project_dir: Path, leaf_count: int,
+                      total: int, native_count: int, highlight: str = "",
+                      query: str = "") -> int:
+    cols = shutil.get_terminal_size((140, 24)).columns
+    page = items[offset:offset + _NODE_PAGE]
+    num_w = max(2, len(str(len(items))))
+    # prefix cells: "  ▶ " + "NN. " + "MM-DD HH:MM" + "  " + "xxxxxxxx" + "  L  ★  "
+    head_w = 4 + (num_w + 1) + 1 + 11 + 2 + 8 + 2 + 1 + 2 + 1 + 2
+    text_w = max(15, cols - head_w - 2)
+
+    proj_str = _truncate_w(str(project_dir), cols - 14)
+    lines: List[str] = [
+        dim(f"project dir:  {proj_str}"),
+        (dim("nodes total: ") + bold(str(total))
+         + dim("   leaves: ") + bold(str(leaf_count))
+         + dim("   native: ") + purple(f"★ {native_count}")
+         + dim("   atr-only: ") + str(total - native_count)),
+    ]
+    if query:
+        lines.append(dim("query: ") + bold(repr(query))
+                     + dim("   matches: ") + bold(str(len(items))))
+    lines.append(dim("↑↓ move · ⏎ select · 1-9 jump · q quit"))
+    lines.append("")
+    head_line = (f"  {'#'.rjust(num_w + 1)}  {'time':<11}  {'uuid':<8}  L  ★  prompt")
+    lines.append(dim(head_line))
+    lines.append(dim("─" * min(cols - 1, head_w + min(text_w, 60))))
+
+    for i, n in enumerate(page):
+        abs_idx = offset + i
+        num_str = f"{abs_idx + 1:>{num_w}}."
+        ts = _format_time(n["timestamp"])
+        uid = n["uuid"][:8]
+        leaf = green("·") if not n["children"] else " "
+        nat = purple("★") if n["uuid"] in native_reachable else " "
+        text = re.sub(r"\s+", " ", n["text"]).strip()
+        text = _truncate_w(text, text_w)
+        text = _highlight(text, highlight)
+        if abs_idx == selected:
+            arrow = green("▶")
+            row = (f"  {arrow} {bold(num_str)}  {dim(ts)}  {dim(uid)}  "
+                   f"{leaf}  {nat}  {bold(text)}")
+        else:
+            row = (f"    {dim(num_str)}  {dim(ts)}  {dim(uid)}  "
+                   f"{leaf}  {nat}  {text}")
+        lines.append(row)
+
+    if len(items) > _NODE_PAGE:
+        lines.append(dim(
+            f"    … showing {offset + 1}-{offset + len(page)} of {len(items)}"
+        ))
+
+    for line in lines:
+        print(line)
+    return len(lines)
+
+
+def pick_node_interactive(items: List[dict], native_reachable: set,
+                          project_dir: Path, leaf_count: int, total: int,
+                          native_count: int, highlight: str = "",
+                          query: str = "") -> Optional[dict]:
+    """Paginated picker for node items. Returns the picked node or None.
+
+    Matches the project picker's UX: ↑↓ navigate, Enter selects, 1-9 absolute
+    jump within the full list, q / Esc cancels. Max 10 items per page with
+    the rest reachable via arrow-key scrolling.
+    """
+    if not items or not sys.stdin.isatty() or not sys.stdout.isatty():
         return None
-    if not sys.stdin.isatty():
-        return None
-    try:
-        s = input(bold("pick number to generate resume (enter to skip): ")).strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return None
-    if not s:
-        return None
-    try:
-        i = int(s) - 1
-        if 0 <= i < len(items):
-            return items[i]
-    except ValueError:
-        pass
-    print(red("invalid number"), file=sys.stderr)
-    return None
+
+    selected = 0
+    offset = 0
+    drawn = _pick_node_render(items, native_reachable, selected, offset,
+                              project_dir, leaf_count, total, native_count,
+                              highlight=highlight, query=query)
+    with _RawInput() as raw:
+        while True:
+            try:
+                key = raw.read_key()
+            except KeyboardInterrupt:
+                _menu_clear(drawn)
+                return None
+
+            old_sel = selected
+            if key == "down":
+                selected = (selected + 1) % len(items)
+            elif key == "up":
+                selected = (selected - 1) % len(items)
+            elif key == "enter":
+                _menu_clear(drawn)
+                return items[selected]
+            elif key in ("q", "Q", "esc"):
+                _menu_clear(drawn)
+                return None
+            elif key.isdigit() and key != "0":
+                idx = int(key) - 1
+                if 0 <= idx < len(items):
+                    _menu_clear(drawn)
+                    return items[idx]
+
+            if selected != old_sel:
+                if selected < offset:
+                    offset = selected
+                elif selected >= offset + _NODE_PAGE:
+                    offset = selected - _NODE_PAGE + 1
+                _menu_clear(drawn)
+                drawn = _pick_node_render(items, native_reachable, selected,
+                                          offset, project_dir, leaf_count,
+                                          total, native_count,
+                                          highlight=highlight, query=query)
 
 
 # ---------- commands ----------
@@ -524,6 +617,26 @@ def _show_items(args, items: List[dict], nodes: Dict[str, dict], native: set,
         with_pager(render)
 
 
+def _maybe_pick(args, items, nodes, native, pd, by_uuid,
+                highlight: str = "", query: str = "") -> bool:
+    """Returns True if the paginated picker was used (and the table dump should
+    be skipped). Returns False if non-tty or non-pick mode — caller falls back
+    to _show_items + no input prompt."""
+    tree_mode = getattr(args, "tree", False)
+    if not (args.pick and items and not tree_mode
+            and sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    leaf_count = sum(1 for n in nodes.values() if not n["children"])
+    choice = pick_node_interactive(
+        items, native, pd,
+        leaf_count=leaf_count, total=len(nodes), native_count=len(native),
+        highlight=highlight, query=query,
+    )
+    if choice:
+        emit_resume(pd, choice, by_uuid, exec_after=args.exec_)
+    return True
+
+
 def cmd_browse(args) -> None:
     pd, nodes, native, by_uuid = _gather(args.path, getattr(args, "scope_root", None))
     items = list(nodes.values())
@@ -533,12 +646,9 @@ def cmd_browse(args) -> None:
     if args.limit:
         items = items[: args.limit]
 
+    if _maybe_pick(args, items, nodes, native, pd, by_uuid):
+        return
     _show_items(args, items, nodes, native, pd)
-
-    if args.pick and not getattr(args, "tree", False):
-        choice = pick_interactive(items)
-        if choice:
-            emit_resume(pd, choice, by_uuid, exec_after=args.exec_)
 
 
 def cmd_search(args) -> None:
@@ -549,12 +659,10 @@ def cmd_search(args) -> None:
     if args.limit:
         matches = matches[: args.limit]
 
+    if _maybe_pick(args, matches, nodes, native, pd, by_uuid,
+                   highlight=args.query, query=args.query):
+        return
     _show_items(args, matches, nodes, native, pd, highlight=args.query)
-
-    if args.pick and not getattr(args, "tree", False):
-        choice = pick_interactive(matches)
-        if choice:
-            emit_resume(pd, choice, by_uuid, exec_after=args.exec_)
 
 
 def cmd_tree(args) -> None:
@@ -953,7 +1061,11 @@ class _RawInput:
 
     def close(self) -> None:
         import termios
-        termios.tcsetattr(self.fd, termios.TCSANOW, self.old)
+        # TCSAFLUSH (vs TCSANOW) drains any pending raw-mode input that wasn't
+        # consumed before reverting to canonical mode — without it, stale bytes
+        # (e.g. an arrow-key sequence the user typed-ahead) get fed to the next
+        # input() call and show up literally as `^[[B`.
+        termios.tcsetattr(self.fd, termios.TCSAFLUSH, self.old)
 
     def __enter__(self) -> "_RawInput":
         return self
@@ -1097,6 +1209,14 @@ def interactive_menu(path: str, scope_root: Optional[str] = None) -> Optional[Tu
             scope_summary = scope_root[:8]
 
     drawn = _menu_render(selected, pd, scope_summary)
+    # Run the navigation loop entirely inside cbreak, capture the chosen
+    # command, then exit the with block BEFORE prompting for any text input.
+    # input()'s readline does its own termios handling — overlapping that with
+    # our raw-mode context leaves stdin in a half-canonical half-cbreak limbo
+    # where backspace/arrow keys at the input prompt produce raw byte echoes
+    # (`^[[B`, `^?`) instead of editing the line.
+    chosen_cmd: Optional[str] = None
+    chosen_prompt_label: Optional[str] = None
     with _RawInput() as raw:
         while True:
             try:
@@ -1114,19 +1234,9 @@ def interactive_menu(path: str, scope_root: Optional[str] = None) -> Optional[Tu
             elif key == "enter":
                 cmd, _label, _hint, prompt_label = _MENU[selected]
                 _menu_clear(drawn)
-                raw.close()  # drop cbreak before regular input()
-                if cmd == "quit":
-                    return None
-                if prompt_label:
-                    try:
-                        val = input(bold(prompt_label + ": ")).strip()
-                    except (EOFError, KeyboardInterrupt):
-                        print()
-                        return None
-                    if not val:
-                        return None
-                    return (cmd, val)
-                return (cmd, None)
+                chosen_cmd = cmd
+                chosen_prompt_label = prompt_label
+                break
             elif key in ("q", "Q", "esc"):
                 _menu_clear(drawn)
                 return None
@@ -1135,24 +1245,28 @@ def interactive_menu(path: str, scope_root: Optional[str] = None) -> Optional[Tu
                 if 0 <= idx < len(_MENU):
                     cmd, _label, _hint, prompt_label = _MENU[idx]
                     _menu_clear(drawn)
-                    raw.close()
-                    if cmd == "quit":
-                        return None
-                    if prompt_label:
-                        try:
-                            val = input(bold(prompt_label + ": ")).strip()
-                        except (EOFError, KeyboardInterrupt):
-                            print()
-                            return None
-                        if not val:
-                            return None
-                        return (cmd, val)
-                    return (cmd, None)
+                    chosen_cmd = cmd
+                    chosen_prompt_label = prompt_label
+                    break
 
             if new_sel != selected:
                 selected = new_sel
                 _menu_clear(drawn)
                 drawn = _menu_render(selected, pd, scope_summary)
+
+    # Terminal is back in canonical mode here (with stdin flushed by TCSAFLUSH).
+    if chosen_cmd is None or chosen_cmd == "quit":
+        return None
+    if chosen_prompt_label:
+        try:
+            val = input(bold(chosen_prompt_label + ": ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if not val:
+            return None
+        return (chosen_cmd, val)
+    return (chosen_cmd, None)
 
 
 def _ns_for(cmd: str, value: Optional[str], path: str,
