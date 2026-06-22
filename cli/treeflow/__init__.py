@@ -1208,6 +1208,9 @@ def _browse_render(state: dict, items: List[dict], all_nodes: Dict[str, dict],
     rows = shutil.get_terminal_size((80, 24)).lines
     body_capacity = max(5, rows - len(lines) - 4)
     page_size = min(_NODE_PAGE, body_capacity)
+    # Publish the actually-rendered page size so scroll triggers (↓/↑)
+    # match the visible window rather than the configured maximum.
+    state["_visible_page"] = page_size
 
     if view == "tree":
         # Items here is the flattened tree (list of dicts each containing
@@ -1546,8 +1549,9 @@ def browse_project(project_dir: Path, all_nodes: Dict[str, dict], native: set,
             elif key == "down":
                 if items:
                     state["selected"] = min(state["selected"] + 1, len(items) - 1)
-                    if state["selected"] >= state["offset"] + _NODE_PAGE:
-                        state["offset"] = state["selected"] - _NODE_PAGE + 1
+                    page = state.get("_visible_page", _NODE_PAGE)
+                    if state["selected"] >= state["offset"] + page:
+                        state["offset"] = state["selected"] - page + 1
                     _menu_clear(drawn)
                     drawn = _browse_render(state, items, all_nodes, native, project_dir, scope_summary)
             elif key == "up":
@@ -2111,9 +2115,18 @@ _PROJECT_PAGE = int(_cfg("page_size", default=50))
 
 
 def _root_render(roots: List[dict], selected: int, offset: int,
-                 scope_note: str = "", show_dir: bool = False) -> int:
+                 scope_note: str = "", show_dir: bool = False
+                 ) -> Tuple[int, int]:
+    """Returns (printed_line_count, visible_page_size). The visible page is
+    `_PROJECT_PAGE` capped by the actual terminal height so the cursor never
+    moves past the last rendered row."""
     cols = shutil.get_terminal_size((140, 24)).columns
-    visible = roots[offset:offset + _PROJECT_PAGE]
+    rows = shutil.get_terminal_size((140, 24)).lines
+    # 4 header lines + the trailing "showing X-Y of Z" line (when applicable)
+    # + a couple of safety rows so we don't print right at the bottom edge.
+    body_capacity = max(3, rows - 4 - 1 - 2)
+    page_size = min(_PROJECT_PAGE, body_capacity)
+    visible = roots[offset:offset + page_size]
     num_w = max(2, len(str(len(roots))))
     max_n_w = max((len(str(r["node_count"])) for r in roots), default=1)
     # Pre-compute the relative-time column width across the visible page so the
@@ -2154,11 +2167,11 @@ def _root_render(roots: List[dict], selected: int, offset: int,
             row = (f"    {dim(num_str)} {nat} {dim(ts_padded)}  "
                    f"{dim(nodes_raw)}  {dir_str}{title}")
         lines.append(row)
-    if len(roots) > _PROJECT_PAGE:
+    if len(roots) > page_size:
         lines.append(dim(f"    … showing {offset + 1}-{offset + len(visible)} of {len(roots)}"))
     for line in lines:
         print(line)
-    return len(lines)
+    return len(lines), page_size
 
 
 def pick_project(default_path: str, all_projects: bool = False,
@@ -2194,7 +2207,7 @@ def pick_project(default_path: str, all_projects: bool = False,
     offset = 0
     show_dir = use_all  # only show project-dir column when listing across dirs
 
-    drawn = _root_render(roots, selected, offset, scope_note, show_dir)
+    drawn, page = _root_render(roots, selected, offset, scope_note, show_dir)
     with _RawInput() as raw:
         while True:
             try:
@@ -2225,7 +2238,7 @@ def pick_project(default_path: str, all_projects: bool = False,
                 selected = 0
                 offset = 0
                 _menu_clear(drawn)
-                drawn = _root_render(roots, selected, offset, scope_note, show_dir)
+                drawn, page = _root_render(roots, selected, offset, scope_note, show_dir)
                 continue
             elif key.isdigit() and key != "0":
                 idx = int(key) - 1
@@ -2237,10 +2250,10 @@ def pick_project(default_path: str, all_projects: bool = False,
             if selected != old_selected:
                 if selected < offset:
                     offset = selected
-                elif selected >= offset + _PROJECT_PAGE:
-                    offset = selected - _PROJECT_PAGE + 1
+                elif selected >= offset + page:
+                    offset = selected - page + 1
                 _menu_clear(drawn)
-                drawn = _root_render(roots, selected, offset, scope_note, show_dir)
+                drawn, page = _root_render(roots, selected, offset, scope_note, show_dir)
 
 
 # (Old action menu removed — the post-project flow is now the unified
