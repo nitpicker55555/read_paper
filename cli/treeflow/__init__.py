@@ -1290,8 +1290,90 @@ def _compute_browse_items(state: dict, all_nodes: Dict[str, dict]) -> List:
     return nodes_list
 
 
+def _render_node_detail(node: dict, driver: Any, native_set: set,
+                        project_dir: Path) -> None:
+    """Print the full detail view for a node — both halves of the turn plus
+    the resume command. Runs inside the alternate screen buffer, so we can
+    print as much as we want without worrying about preserving the layout."""
+    cols = shutil.get_terminal_size((140, 24)).columns
+    uid = node["uuid"]
+    is_native = uid in native_set
+    native_sid = node.get("native_session_id")
+    reply = (node.get("answer_text") or "").rstrip()
+    prompt = (node.get("text") or "").rstrip()
+
+    print(bold("treeflow") + dim(" · node detail"))
+    print(dim("─" * min(cols, 100)))
+    print(f"  {bold('uuid')      :<18}  {uid}")
+    print(f"  {bold('time')      :<18}  {_format_time(node['timestamp'])}"
+          + dim(f"   ({node['timestamp'] or '—'})"))
+    print(f"  {bold('session')   :<18}  {dim(node['session_id'] or '—')}")
+    if node.get("cwd"):
+        print(f"  {bold('cwd')   :<18}  {dim(node['cwd'])}")
+    print(f"  {bold('native')    :<18}  "
+          + (purple('★ yes') if is_native else dim('no')))
+    print(f"  {bold('parent')    :<18}  {dim(node['parent'] or '(root)')}")
+    print(f"  {bold('children')  :<18}  {len(node['children'])}")
+    print()
+
+    print(bold("── user prompt ") + dim("─" * max(0, min(cols, 100) - 16)))
+    print(prompt if prompt else dim("(empty)"))
+    print()
+
+    print(bold("── assistant reply ") + dim("─" * max(0, min(cols, 100) - 20)))
+    if reply:
+        print(reply)
+    else:
+        print(dim("(no recorded assistant reply for this node)"))
+    print()
+
+    print(bold("── resume ") + dim("─" * max(0, min(cols, 100) - 11)))
+    if native_sid:
+        cmd = f"{driver.resume_verb} {native_sid}"
+        print(f"  {bold('$')} {cmd}")
+        print(dim("  native target — stock `--resume` already lands here, "
+                  "no synthetic file needed"))
+    else:
+        print(dim(f"  This node is on an abandoned branch. treeflow will "
+                  f"write a fresh\n  synthetic session file and run:"))
+        print()
+        print(f"  {bold('$')} {driver.resume_verb} {dim('<new-session-id>')}")
+    print()
+    print(dim("  ⏎ resume · ← / ⎋ back · ^C quit"))
+
+
+def _show_node_detail(node: dict, raw: "_RawInput", driver: Any,
+                      native_set: set, project_dir: Path) -> Optional[object]:
+    """Detail screen for one picked node. Uses the alternate screen buffer so
+    long prompts/replies render cleanly without clobbering the browser layout
+    underneath. Returns BACK (go back to browser), True (proceed to resume),
+    or None (quit)."""
+    # Enter alt screen + clear + cursor home.
+    sys.stdout.write("\x1b[?1049h\x1b[H\x1b[2J")
+    sys.stdout.flush()
+    try:
+        while True:
+            sys.stdout.write("\x1b[H\x1b[2J")
+            sys.stdout.flush()
+            _render_node_detail(node, driver, native_set, project_dir)
+            try:
+                key = raw.read_key()
+            except KeyboardInterrupt:
+                return None
+            if key in ("left", "esc", "backspace", "q", "Q"):
+                return BACK
+            if key == "enter":
+                return True
+            # Any other key: just redraw (no state change in the detail view).
+    finally:
+        # Leave alt screen — the browser underneath is restored exactly.
+        sys.stdout.write("\x1b[?1049l")
+        sys.stdout.flush()
+
+
 def browse_project(project_dir: Path, all_nodes: Dict[str, dict], native: set,
-                   scope_summary: str = "") -> Optional[object]:
+                   scope_summary: str = "", driver: Any = None
+                   ) -> Optional[object]:
     """The unified post-project browser. Combines view-mode switching with a
     live search box. Returns either a node dict (to resume), BACK (go back to
     project picker), or None (quit)."""
@@ -1331,7 +1413,22 @@ def browse_project(project_dir: Path, all_nodes: Dict[str, dict], native: set,
                 if items:
                     entry = items[state["selected"]]
                     node = entry.get("node") if isinstance(entry, dict) and "filler" in entry else entry
-                    if node:
+                    if node and driver is not None:
+                        # Pop into the detail view. If the user backs out we
+                        # come straight back to the same browser screen with
+                        # selection preserved; if they confirm, return the
+                        # node up to main() to do the resume.
+                        decision = _show_node_detail(node, raw, driver, native, project_dir)
+                        if decision is None:
+                            _menu_clear(drawn)
+                            return None
+                        if decision is BACK:
+                            continue
+                        # decision is True → resume this node.
+                        _menu_clear(drawn)
+                        return node
+                    elif node:
+                        # No driver provided (e.g. test) — keep legacy behavior.
                         _menu_clear(drawn)
                         return node
             elif key == "tab":
@@ -2234,7 +2331,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                     if len(snippet) > 50:
                         snippet = snippet[:49] + "…"
                     scope_summary = f"{chosen_path} · root {chosen_root[:8]} · {snippet}"
-            result = browse_project(pd, nodes, native, scope_summary)
+            result = browse_project(pd, nodes, native, scope_summary, driver=driver)
             if result is None:
                 return
             if result is BACK:
