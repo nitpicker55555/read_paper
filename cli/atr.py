@@ -431,83 +431,239 @@ def with_pager(render_fn) -> str:
 
 
 _NODE_PAGE = 10
+_VIEW_CYCLE = ("tree", "list", "leaves")
 
 
-def _pick_node_render(items: List[dict], native_reachable: set, selected: int,
-                      offset: int, project_dir: Path, leaf_count: int,
-                      total: int, native_count: int, highlight: str = "",
-                      query: str = "") -> int:
+def _flatten_tree(roots: List[str], nodes: Dict[str, dict]) -> List[Tuple[str, str, str, bool]]:
+    """Iterative depth-first walk that mirrors render_tree's compact collapsing.
+
+    Yields (uuid_or_None, prefix, branch_glyph, is_last). When uuid is None the
+    entry is the "⋮ N hidden" filler — not selectable. Linear single-child runs
+    are collapsed so a 1700-node tree renders in a screenful of structural rows.
+    """
+    out: List[Tuple[Optional[str], str, str, bool]] = []
+
+    def sort_key(uid: str) -> str:
+        return nodes[uid]["timestamp"] or ""
+
+    roots_sorted = sorted(roots, key=sort_key)
+    for ri, root in enumerate(roots_sorted):
+        if ri > 0:
+            out.append((None, "", "", True))  # blank separator between roots
+        stack: List[Tuple[str, str, str, bool]] = [(root, "", "● ", True)]
+        while stack:
+            uid, prefix, glyph, is_last = stack.pop()
+            run = [uid]
+            current = uid
+            cap = len(nodes) + 1
+            while len(nodes[current]["children"]) == 1 and cap > 0:
+                cap -= 1
+                child = nodes[current]["children"][0]
+                if child in run:
+                    break
+                run.append(child)
+                current = child
+            tail = run[-1]
+            run_len = len(run)
+            cont_prefix = prefix + ("   " if is_last else "│  ")
+            if run_len == 1:
+                out.append((uid, prefix, glyph, is_last))
+            elif run_len == 2:
+                out.append((uid, prefix, glyph, is_last))
+                out.append((tail, cont_prefix, "└─ ", True))
+            else:
+                out.append((uid, prefix, glyph, is_last))
+                out.append((None, cont_prefix, f"⋮ ({run_len - 2} hidden)", True))
+                out.append((tail, cont_prefix, "└─ ", True))
+
+            tail_children = sorted(nodes[tail]["children"], key=sort_key)
+            child_prefix = cont_prefix + ("   " if run_len > 1 else "")
+            n_kids = len(tail_children)
+            for i in range(n_kids - 1, -1, -1):
+                child_last = (i == n_kids - 1)
+                child_glyph = "└─ " if child_last else "├─ "
+                stack.append((tail_children[i], child_prefix, child_glyph, child_last))
+    return out  # type: ignore[return-value]
+
+
+def _browse_render(state: dict, items: List[dict], all_nodes: Dict[str, dict],
+                   native: set, project_dir: Path, scope_summary: str) -> int:
+    """Render the unified browser screen. Returns line count for menu_clear."""
     cols = shutil.get_terminal_size((140, 24)).columns
-    page = items[offset:offset + _NODE_PAGE]
-    num_w = max(2, len(str(len(items))))
-    # prefix cells: "  ▶ " + "NN. " + "MM-DD HH:MM" + "  " + "xxxxxxxx" + "  L  ★  "
-    head_w = 4 + (num_w + 1) + 1 + 11 + 2 + 8 + 2 + 1 + 2 + 1 + 2
-    text_w = max(15, cols - head_w - 2)
+    view = state["view"]
+    search = state["search"]
+    selected = state["selected"]
+    offset = state["offset"]
 
+    leaf_total = sum(1 for n in all_nodes.values() if not n["children"])
     proj_str = _truncate_w(str(project_dir), cols - 14)
     lines: List[str] = [
-        dim(f"project dir:  {proj_str}"),
-        (dim("nodes total: ") + bold(str(total))
-         + dim("   leaves: ") + bold(str(leaf_count))
-         + dim("   native: ") + purple(f"★ {native_count}")
-         + dim("   atr-only: ") + str(total - native_count)),
+        bold("atr") + dim("  ") + dim(_truncate_w(scope_summary, cols - 6)),
+        dim(f"  {proj_str}"),
+        (dim("  nodes ") + bold(str(len(all_nodes)))
+         + dim(" · leaves ") + bold(str(leaf_total))
+         + dim(" · native ") + purple(f"★ {len(native)}")
+         + dim(" · atr-only ") + str(len(all_nodes) - len(native))),
     ]
-    if query:
-        lines.append(dim("query: ") + bold(repr(query))
-                     + dim("   matches: ") + bold(str(len(items))))
-    lines.append(dim("↑↓ move · ⏎ select · 1-9 jump · ⎋ back · q quit"))
+    # search bar — always visible, cursor block at end
+    cursor = green("▌")
+    search_show = search if search else dim("(type to filter)")
     lines.append("")
-    head_line = (f"  {'#'.rjust(num_w + 1)}  {'time':<11}  {'uuid':<8}  L  ★  prompt")
-    lines.append(dim(head_line))
-    lines.append(dim("─" * min(cols - 1, head_w + min(text_w, 60))))
-
-    for i, n in enumerate(page):
-        abs_idx = offset + i
-        num_str = f"{abs_idx + 1:>{num_w}}."
-        ts = _format_time(n["timestamp"])
-        uid = n["uuid"][:8]
-        leaf = green("·") if not n["children"] else " "
-        nat = purple("★") if n["uuid"] in native_reachable else " "
-        text = re.sub(r"\s+", " ", n["text"]).strip()
-        text = _truncate_w(text, text_w)
-        text = _highlight(text, highlight)
-        if abs_idx == selected:
-            arrow = green("▶")
-            row = (f"  {arrow} {bold(num_str)}  {dim(ts)}  {dim(uid)}  "
-                   f"{leaf}  {nat}  {bold(text)}")
+    lines.append(f"  {bold('search:')} {search_show}{cursor}  "
+                 + dim(f" ({len(items)} match)" if search else f" ({len(items)} total)"))
+    # view tabs
+    tabs = []
+    for v in _VIEW_CYCLE:
+        if v == view:
+            tabs.append(green("[") + bold(v) + green("]"))
         else:
-            row = (f"    {dim(num_str)}  {dim(ts)}  {dim(uid)}  "
-                   f"{leaf}  {nat}  {text}")
-        lines.append(row)
+            tabs.append(dim(f" {v} "))
+    lines.append("  " + "  ".join(tabs) + dim("   (⇥ next view)"))
+    lines.append(dim("  ↑↓ move · ⏎ resume · ⌫ erase · ⎋ back · ^C quit"))
+    lines.append("")
 
-    if len(items) > _NODE_PAGE:
+    if not items:
+        lines.append(dim("  (no nodes match)"))
+        for line in lines:
+            print(line)
+        return len(lines)
+
+    # render body based on view
+    rows = shutil.get_terminal_size((80, 24)).lines
+    body_capacity = max(5, rows - len(lines) - 4)
+    page_size = min(_NODE_PAGE, body_capacity)
+
+    if view == "tree":
+        # Items here is the flattened tree (list of dicts each containing
+        # uuid / prefix / glyph / is_filler / node). selected = index into
+        # selectable (non-filler) entries.
+        page = items[offset:offset + page_size]
+        for line_entry in page:
+            abs_idx = items.index(line_entry)  # could be O(n) but page is small
+            n = line_entry.get("node")
+            if line_entry["filler"]:
+                lines.append(f"  {line_entry['prefix']}{dim(line_entry['glyph'])}")
+                continue
+            ts = _format_time(n["timestamp"])
+            uid_short = dim(n["uuid"][:8])
+            nat = purple("★") if n["uuid"] in native else " "
+            leaf = green("·") if not n["children"] else " "
+            text = re.sub(r"\s+", " ", n["text"]).strip()
+            text_w = max(15, cols - len(line_entry["prefix"]) - len(line_entry["glyph"]) - 30)
+            text = _truncate_w(text, text_w)
+            text = _highlight(text, search)
+            line_str = (f"{line_entry['prefix']}{line_entry['glyph']}{nat} "
+                        f"{dim(ts)} {uid_short} {leaf} {text}")
+            if abs_idx == selected:
+                lines.append("▶ " + line_str)
+            else:
+                lines.append("  " + line_str)
+        if len(items) > page_size:
+            lines.append(dim(f"    … showing {offset + 1}-{offset + len(page)} "
+                             f"of {len(items)}"))
+    else:
+        # list / leaves: flat paginated table
+        num_w = max(2, len(str(len(items))))
+        head_w = 4 + (num_w + 1) + 1 + 11 + 2 + 8 + 2 + 1 + 2 + 1 + 2
+        text_w = max(15, cols - head_w - 2)
         lines.append(dim(
-            f"    … showing {offset + 1}-{offset + len(page)} of {len(items)}"
+            f"  {'#'.rjust(num_w + 1)}  {'time':<11}  {'uuid':<8}  L  ★  prompt"
         ))
+        lines.append(dim("─" * min(cols - 1, head_w + min(text_w, 60))))
+        page = items[offset:offset + page_size]
+        for i, n in enumerate(page):
+            abs_idx = offset + i
+            num_str = f"{abs_idx + 1:>{num_w}}."
+            ts = _format_time(n["timestamp"])
+            uid = n["uuid"][:8]
+            leaf = green("·") if not n["children"] else " "
+            nat = purple("★") if n["uuid"] in native else " "
+            text = re.sub(r"\s+", " ", n["text"]).strip()
+            text = _truncate_w(text, text_w)
+            text = _highlight(text, search)
+            if abs_idx == selected:
+                arrow = green("▶")
+                row = (f"  {arrow} {bold(num_str)}  {dim(ts)}  {dim(uid)}  "
+                       f"{leaf}  {nat}  {bold(text)}")
+            else:
+                row = (f"    {dim(num_str)}  {dim(ts)}  {dim(uid)}  "
+                       f"{leaf}  {nat}  {text}")
+            lines.append(row)
+        if len(items) > page_size:
+            lines.append(dim(f"    … showing {offset + 1}-{offset + len(page)} "
+                             f"of {len(items)}"))
 
     for line in lines:
         print(line)
     return len(lines)
 
 
-def pick_node_interactive(items: List[dict], native_reachable: set,
-                          project_dir: Path, leaf_count: int, total: int,
-                          native_count: int, highlight: str = "",
-                          query: str = "") -> Optional[dict]:
-    """Paginated picker for node items. Returns the picked node or None.
+def _compute_browse_items(state: dict, all_nodes: Dict[str, dict]) -> List:
+    """Return the items list to render given the current view + search.
 
-    Matches the project picker's UX: ↑↓ navigate, Enter selects, 1-9 absolute
-    jump within the full list, q / Esc cancels. Max 10 items per page with
-    the rest reachable via arrow-key scrolling.
-    """
-    if not items or not sys.stdin.isatty() or not sys.stdout.isatty():
+    For tree view the items are flattened tree-line dicts; for list/leaves they
+    are raw node dicts. Selection indexes into the returned list."""
+    view = state["view"]
+    search = state["search"].lower()
+
+    if view == "tree":
+        roots = [u for u, n in all_nodes.items()
+                 if not (n["parent"] and n["parent"] in all_nodes)]
+        flat = _flatten_tree(roots, all_nodes)
+        items = []
+        for uuid_, prefix, glyph, _is_last in flat:
+            items.append({
+                "uuid": uuid_,
+                "node": all_nodes[uuid_] if uuid_ else None,
+                "prefix": prefix,
+                "glyph": glyph,
+                "filler": uuid_ is None,
+            })
+        if search:
+            # In tree view, keep structural parents so the matching nodes still
+            # show in context. Simple heuristic: include any line whose node
+            # text matches (filler entries are removed when searching).
+            items = [it for it in items
+                     if (not it["filler"]) and search in (it["node"]["text"] or "").lower()]
+        return items
+
+    if view == "leaves":
+        nodes_list = [n for n in all_nodes.values() if not n["children"]]
+    else:  # list
+        nodes_list = list(all_nodes.values())
+    nodes_list.sort(key=lambda n: n["timestamp"] or "", reverse=True)
+    if search:
+        nodes_list = [n for n in nodes_list if search in (n["text"] or "").lower()]
+    return nodes_list
+
+
+def browse_project(project_dir: Path, all_nodes: Dict[str, dict], native: set,
+                   scope_summary: str = "") -> Optional[object]:
+    """The unified post-project browser. Combines view-mode switching with a
+    live search box. Returns either a node dict (to resume), BACK (go back to
+    project picker), or None (quit)."""
+    if not all_nodes or not sys.stdin.isatty() or not sys.stdout.isatty():
         return None
 
-    selected = 0
-    offset = 0
-    drawn = _pick_node_render(items, native_reachable, selected, offset,
-                              project_dir, leaf_count, total, native_count,
-                              highlight=highlight, query=query)
+    state = {
+        "view": "tree",
+        "search": "",
+        "selected": 0,
+        "offset": 0,
+    }
+
+    items = _compute_browse_items(state, all_nodes)
+    drawn = _browse_render(state, items, all_nodes, native, project_dir, scope_summary)
+
+    def refresh(keep_selection: bool = False) -> None:
+        nonlocal items, drawn
+        items = _compute_browse_items(state, all_nodes)
+        if not keep_selection or state["selected"] >= len(items):
+            state["selected"] = 0
+            state["offset"] = 0
+        _menu_clear(drawn)
+        drawn = _browse_render(state, items, all_nodes, native, project_dir, scope_summary)
+
     with _RawInput() as raw:
         while True:
             try:
@@ -516,36 +672,53 @@ def pick_node_interactive(items: List[dict], native_reachable: set,
                 _menu_clear(drawn)
                 return None
 
-            old_sel = selected
-            if key == "down":
-                selected = (selected + 1) % len(items)
-            elif key == "up":
-                selected = (selected - 1) % len(items)
-            elif key == "enter":
-                _menu_clear(drawn)
-                return items[selected]
-            elif key in ("q", "Q"):
-                _menu_clear(drawn)
-                return None
-            elif key in ("esc", "left", "backspace"):
-                _menu_clear(drawn)
-                return BACK
-            elif key.isdigit() and key != "0":
-                idx = int(key) - 1
-                if 0 <= idx < len(items):
+            if key == "enter":
+                if items:
+                    entry = items[state["selected"]]
+                    node = entry.get("node") if isinstance(entry, dict) and "filler" in entry else entry
+                    if node:
+                        _menu_clear(drawn)
+                        return node
+            elif key == "tab":
+                idx = _VIEW_CYCLE.index(state["view"])
+                state["view"] = _VIEW_CYCLE[(idx + 1) % len(_VIEW_CYCLE)]
+                refresh()
+            elif key == "shift-tab":
+                idx = _VIEW_CYCLE.index(state["view"])
+                state["view"] = _VIEW_CYCLE[(idx - 1) % len(_VIEW_CYCLE)]
+                refresh()
+            elif key == "esc":
+                if state["search"]:
+                    state["search"] = ""
+                    refresh()
+                else:
                     _menu_clear(drawn)
-                    return items[idx]
-
-            if selected != old_sel:
-                if selected < offset:
-                    offset = selected
-                elif selected >= offset + _NODE_PAGE:
-                    offset = selected - _NODE_PAGE + 1
-                _menu_clear(drawn)
-                drawn = _pick_node_render(items, native_reachable, selected,
-                                          offset, project_dir, leaf_count,
-                                          total, native_count,
-                                          highlight=highlight, query=query)
+                    return BACK
+            elif key == "backspace":
+                if state["search"]:
+                    state["search"] = state["search"][:-1]
+                    refresh()
+                else:
+                    _menu_clear(drawn)
+                    return BACK
+            elif key == "down":
+                if items:
+                    state["selected"] = min(state["selected"] + 1, len(items) - 1)
+                    if state["selected"] >= state["offset"] + _NODE_PAGE:
+                        state["offset"] = state["selected"] - _NODE_PAGE + 1
+                    _menu_clear(drawn)
+                    drawn = _browse_render(state, items, all_nodes, native, project_dir, scope_summary)
+            elif key == "up":
+                if items:
+                    state["selected"] = max(state["selected"] - 1, 0)
+                    if state["selected"] < state["offset"]:
+                        state["offset"] = state["selected"]
+                    _menu_clear(drawn)
+                    drawn = _browse_render(state, items, all_nodes, native, project_dir, scope_summary)
+            elif len(key) == 1 and key.isprintable():
+                state["search"] += key
+                refresh()
+            # any other key (left, right, unknown, etc.) — ignore silently
 
 
 # ---------- commands ----------
@@ -619,46 +792,13 @@ def _show_items(args, items: List[dict], nodes: Dict[str, dict], native: set,
         else:
             render_table(items, native, out, highlight=highlight)
 
-    if args.pick and items and sys.stdin.isatty() and sys.stdout.isatty():
-        # Picking needs the prompt to land right after the listing — skip pager.
-        # User can still narrow with -n / search / leaves to fit screen.
-        buf = io.StringIO()
-        render(buf)
-        sys.stdout.write(buf.getvalue())
-    else:
-        with_pager(render)
-
-
-def _maybe_pick(args, items, nodes, native, pd, by_uuid,
-                highlight: str = "", query: str = ""):
-    """Drive the paginated node picker when in interactive pick mode.
-
-    Returns:
-      None  — picker wasn't used (non-tty or no items); caller should fall
-              back to the static table dump.
-      BACK  — user wants to go back one layer.
-      True  — picker handled the flow (selected or quit). Caller is done.
-    """
-    tree_mode = getattr(args, "tree", False)
-    if not (args.pick and items and not tree_mode
-            and sys.stdin.isatty() and sys.stdout.isatty()):
-        return None
-    leaf_count = sum(1 for n in nodes.values() if not n["children"])
-    choice = pick_node_interactive(
-        items, native, pd,
-        leaf_count=leaf_count, total=len(nodes), native_count=len(native),
-        highlight=highlight, query=query,
-    )
-    if choice is BACK:
-        return BACK
-    if choice is None:
-        return True  # quit
-    emit_resume(pd, choice, by_uuid, exec_after=args.exec_)
-    return True
+    with_pager(render)
 
 
 def cmd_browse(args):
-    pd, nodes, native, by_uuid = _gather(args.path, getattr(args, "scope_root", None))
+    """CLI dump for `atr list` / `atr leaves`. Pure print, no interactive
+    picker — the picker is reached via bare `atr` which opens browse_project."""
+    pd, nodes, native, _by_uuid = _gather(args.path, getattr(args, "scope_root", None))
     items = list(nodes.values())
     if args.leaves:
         items = [n for n in items if not n["children"]]
@@ -670,17 +810,12 @@ def cmd_browse(args):
         _emit_node_listing(pd, nodes, native, items)
         return None
 
-    handled = _maybe_pick(args, items, nodes, native, pd, by_uuid)
-    if handled is BACK:
-        return BACK
-    if handled:
-        return None
     _show_items(args, items, nodes, native, pd)
     return None
 
 
 def cmd_search(args):
-    pd, nodes, native, by_uuid = _gather(args.path, getattr(args, "scope_root", None))
+    pd, nodes, native, _by_uuid = _gather(args.path, getattr(args, "scope_root", None))
     q = args.query.lower()
     matches = [n for n in nodes.values() if q in n["text"].lower()]
     matches.sort(key=lambda n: n["timestamp"], reverse=True)
@@ -691,12 +826,6 @@ def cmd_search(args):
         _emit_node_listing(pd, nodes, native, matches, query=args.query)
         return None
 
-    handled = _maybe_pick(args, matches, nodes, native, pd, by_uuid,
-                         highlight=args.query, query=args.query)
-    if handled is BACK:
-        return BACK
-    if handled:
-        return None
     _show_items(args, matches, nodes, native, pd, highlight=args.query)
     return None
 
@@ -938,11 +1067,6 @@ def _emit_tree_json(pd: Path, nodes: dict, native: set) -> None:
 
 # ---------- arg parsing ----------
 
-def _add_common_pick(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--no-pick", action="store_false", dest="pick",
-                   help="don't prompt for pick after listing")
-    p.add_argument("-x", "--exec", action="store_true", dest="exec_",
-                   help="after picking, exec `claude --resume <new-sid>` directly")
 
 
 def _add_common_view(p: argparse.ArgumentParser, default_limit: int = 0) -> None:
@@ -972,25 +1096,22 @@ def build_parser() -> argparse.ArgumentParser:
                          "not just the one matching cwd")
     sub = ap.add_subparsers(dest="cmd")
 
-    p_list = sub.add_parser("list", aliases=["ls"], help="list conversations, most recent first")
+    p_list = sub.add_parser("list", aliases=["ls"], help="dump every node in a table (newest first)")
     p_list.add_argument("-L", "--leaves", action="store_true", help="only branch tails")
     _add_common_view(p_list)
-    _add_common_pick(p_list)
     _add_json_flag(p_list)
-    p_list.set_defaults(func=cmd_browse, pick=True, exec_=False, leaves=False, tree=False)
+    p_list.set_defaults(func=cmd_browse, leaves=False, tree=False)
 
-    p_leaves = sub.add_parser("leaves", help="show only leaf nodes (branch tails)")
+    p_leaves = sub.add_parser("leaves", help="dump only leaf nodes (branch tails)")
     _add_common_view(p_leaves)
-    _add_common_pick(p_leaves)
     _add_json_flag(p_leaves)
-    p_leaves.set_defaults(func=cmd_browse, pick=True, exec_=False, leaves=True, tree=False)
+    p_leaves.set_defaults(func=cmd_browse, leaves=True, tree=False)
 
-    p_search = sub.add_parser("search", aliases=["s"], help="search by keyword in prompt content")
+    p_search = sub.add_parser("search", aliases=["s"], help="dump prompts matching a substring")
     p_search.add_argument("query")
     _add_common_view(p_search)
-    _add_common_pick(p_search)
     _add_json_flag(p_search)
-    p_search.set_defaults(func=cmd_search, pick=True, exec_=False, tree=False)
+    p_search.set_defaults(func=cmd_search, tree=False)
 
     p_tree = sub.add_parser("tree", aliases=["t"], help="ASCII tree of the whole project")
     p_tree.add_argument("-m", "--match", default="",
@@ -1247,18 +1368,9 @@ def pick_project(default_path: str, all_projects: bool = False) -> Optional[Tupl
                 drawn = _root_render(roots, selected, offset, scope_note, show_dir)
 
 
-# ---------- interactive menu (tab navigation) ----------
-
-# Menu entries: (cmd, label, hint, takes_input_label)
-_MENU = [
-    ("list",   "list",   "every node, table view, most recent first",  None),
-    ("leaves", "leaves", "only branch tails (leaf nodes)",              None),
-    ("tree",   "tree",   "compact ASCII tree (linear runs collapsed)",  None),
-    ("search", "search", "find prompts by keyword",                     "search query"),
-    ("resume", "resume", "generate resume command for a uuid prefix",   "uuid prefix"),
-    ("info",   "info",   "show full prompt for a node",                 "uuid prefix"),
-    ("quit",   "quit",   "exit",                                        None),
-]
+# (Old action menu removed — the post-project flow is now the unified
+# `browse_project` browser with a persistent search box and Tab-cycled
+# view modes. Use the `atr <subcommand>` CLI for non-interactive workflows.)
 
 
 class _RawInput:
@@ -1364,154 +1476,11 @@ def _read_key_via(raw: Optional[_RawInput] = None) -> str:
         return ri.read_key()
 
 
-def _menu_render(selected: int, project_dir: Path, scope_summary: str = "") -> int:
-    """Render menu lines (header + options). Returns number of lines drawn."""
-    cols = shutil.get_terminal_size((140, 24)).columns
-    proj_line = _truncate_w(str(project_dir), cols - 13)  # "  project:  " = 12 cells
-    lines = [
-        bold("atr") + dim(" · pick an action"),
-        dim("    ↑↓ move · ⏎ select · 1-7 jump · ⎋ back · q quit"),
-        dim(f"    project: {proj_line}"),
-    ]
-    if scope_summary:
-        lines.append(dim(f"    root:    {_truncate_w(scope_summary, cols - 13)}"))
-    lines.append("")
-    for i, (_cmd, label, hint, _inp) in enumerate(_MENU, 1):
-        if i - 1 == selected:
-            arrow = green("▶")
-            row = f"  {arrow} {bold(str(i) + '. ' + label):<14}  {dim(hint)}"
-        else:
-            row = f"    {dim(str(i) + '. ')}{label:<10}  {dim(hint)}"
-        lines.append(row)
-    for line in lines:
-        print(line)
-    return len(lines)
-
-
 def _menu_clear(n: int) -> None:
     """Move cursor up n lines and clear each one."""
     for _ in range(n):
         sys.stdout.write("\x1b[1A\x1b[2K")
     sys.stdout.flush()
-
-
-def interactive_menu(path: str, scope_root: Optional[str] = None) -> Optional[Tuple[str, Optional[str]]]:
-    """Tab-driven menu. Returns (cmd, input_text_or_None) or None to quit.
-    Falls back to None on non-tty environments."""
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        return None
-    pd = project_dir_for(path)
-    selected = 0
-
-    try:
-        from termios import tcgetattr  # smoke-test termios is importable
-    except ImportError:
-        return None  # non-Unix; caller falls back to default `list`
-
-    # When the user picked a specific root, summarize it in the header so
-    # they remember what subtree the next action will operate on.
-    scope_summary = ""
-    if scope_root:
-        try:
-            by_uuid, session_leaf = load_project(pd)
-            nodes, _native = build_nodes(by_uuid, session_leaf)
-            if scope_root in nodes:
-                first_line = re.sub(r"\s+", " ", nodes[scope_root]["text"]).strip()
-                if len(first_line) > 60:
-                    first_line = first_line[:59] + "…"
-                size = len(_subtree(scope_root, nodes))
-                scope_summary = f"{scope_root[:8]}  {size}n  {first_line}"
-        except Exception:  # noqa: BLE001 -- header is best-effort
-            scope_summary = scope_root[:8]
-
-    drawn = _menu_render(selected, pd, scope_summary)
-    # Run the navigation loop entirely inside cbreak, capture the chosen
-    # command, then exit the with block BEFORE prompting for any text input.
-    # input()'s readline does its own termios handling — overlapping that with
-    # our raw-mode context leaves stdin in a half-canonical half-cbreak limbo
-    # where backspace/arrow keys at the input prompt produce raw byte echoes
-    # (`^[[B`, `^?`) instead of editing the line.
-    chosen_cmd: Optional[str] = None
-    chosen_prompt_label: Optional[str] = None
-    with _RawInput() as raw:
-        while True:
-            try:
-                key = raw.read_key()
-            except KeyboardInterrupt:
-                _menu_clear(drawn)
-                print(dim("(cancelled)"))
-                return None
-
-            new_sel = selected
-            if key == "down":
-                new_sel = (selected + 1) % len(_MENU)
-            elif key == "up":
-                new_sel = (selected - 1) % len(_MENU)
-            elif key == "enter":
-                cmd, _label, _hint, prompt_label = _MENU[selected]
-                _menu_clear(drawn)
-                chosen_cmd = cmd
-                chosen_prompt_label = prompt_label
-                break
-            elif key in ("q", "Q"):
-                _menu_clear(drawn)
-                return None
-            elif key in ("esc", "left", "backspace"):
-                _menu_clear(drawn)
-                return BACK
-            elif key.isdigit() and key != "0":
-                idx = int(key) - 1
-                if 0 <= idx < len(_MENU):
-                    cmd, _label, _hint, prompt_label = _MENU[idx]
-                    _menu_clear(drawn)
-                    chosen_cmd = cmd
-                    chosen_prompt_label = prompt_label
-                    break
-
-            if new_sel != selected:
-                selected = new_sel
-                _menu_clear(drawn)
-                drawn = _menu_render(selected, pd, scope_summary)
-
-    # Terminal is back in canonical mode here (with stdin flushed by TCSAFLUSH).
-    if chosen_cmd is None or chosen_cmd == "quit":
-        return None
-    if chosen_prompt_label:
-        try:
-            val = input(bold(chosen_prompt_label + ": ")).strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return None
-        if not val:
-            return None
-        return (chosen_cmd, val)
-    return (chosen_cmd, None)
-
-
-def _ns_for(cmd: str, value: Optional[str], path: str,
-            scope_root: Optional[str] = None) -> argparse.Namespace:
-    """Build an argparse Namespace mimicking the chosen subcommand's defaults."""
-    base = {"path": path, "scope_root": scope_root, "json": False,
-            "all_projects": False}
-    if cmd == "list":
-        return argparse.Namespace(**base, cmd="list", leaves=False, limit=0,
-                                  tree=False, pick=True, exec_=False, func=cmd_browse)
-    if cmd == "leaves":
-        return argparse.Namespace(**base, cmd="leaves", leaves=True, limit=0,
-                                  tree=False, pick=True, exec_=False, func=cmd_browse)
-    if cmd == "tree":
-        return argparse.Namespace(**base, cmd="tree", match="", func=cmd_tree)
-    if cmd == "search":
-        return argparse.Namespace(**base, cmd="search", query=value or "",
-                                  limit=0, tree=False, pick=True, exec_=False,
-                                  func=cmd_search)
-    if cmd == "resume":
-        return argparse.Namespace(**base, cmd="resume", uuid=value or "",
-                                  exec_=False, func=cmd_resume)
-    if cmd == "info":
-        return argparse.Namespace(**base, cmd="info", uuid=value or "",
-                                  func=cmd_info)
-    raise ValueError(f"unknown menu cmd: {cmd}")
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -1522,10 +1491,6 @@ def main(argv: Optional[List[str]] = None) -> None:
         # Explicit subcommand — keep cwd as the default project unless -p was given.
         if args.path is None:
             args.path = os.getcwd()
-        # JSON mode forces non-interactive behavior for scriptability.
-        if getattr(args, "json", False):
-            if hasattr(args, "pick"):
-                args.pick = False
         args.func(args)
         return
 
@@ -1535,48 +1500,57 @@ def main(argv: Optional[List[str]] = None) -> None:
         chosen_root = args.scope_root
         ns = argparse.Namespace(
             path=chosen_path, scope_root=chosen_root, cmd="list",
-            leaves=False, limit=0, tree=False, pick=False, exec_=False,
-            json=False, func=cmd_browse,
+            leaves=False, limit=0, tree=False, json=False, func=cmd_browse,
         )
         ns.func(ns)
         return
 
-    # Three-layer state machine:
-    #   project picker → action menu → command (incl. node picker)
-    # `BACK` from any inner layer pops to the previous layer. `q` / quit at any
-    # layer (or `None` return) drops out of the whole interactive flow.
+    # Two-layer state machine: project picker → unified browser.
+    # `BACK` from the browser pops back to the project picker; either layer's
+    # `Ctrl+C` (KeyboardInterrupt) drops out of the whole interactive flow.
     layer = "project"
     chosen_path: Optional[str] = args.path
     chosen_root: Optional[str] = args.scope_root
     while True:
         if layer == "project":
             if chosen_path is not None:
-                # -p was passed explicitly — skip the project picker on this entry
-                # but allow BACK from the menu to bring us back here. Clear -p so
-                # a subsequent BACK actually shows the picker.
-                layer = "action"
+                layer = "browse"
                 continue
             picked = pick_project(os.getcwd(), all_projects=args.all_projects)
             if picked is None:
                 return  # quit
             chosen_path, chosen_root = picked
-            layer = "action"
-        elif layer == "action":
-            choice = interactive_menu(chosen_path, chosen_root)
-            if choice is None:
-                return  # quit
-            if choice is BACK:
+            layer = "browse"
+        elif layer == "browse":
+            pd = project_dir_for(chosen_path)
+            if not pd.exists():
+                print(red(f"Claude Code project directory not found: {pd}"),
+                      file=sys.stderr)
+                return
+            by_uuid, session_leaf = load_project(pd)
+            nodes, native = build_nodes(by_uuid, session_leaf)
+            if chosen_root:
+                keep = _subtree(chosen_root, nodes)
+                nodes = {u: nodes[u] for u in keep}
+                native = native & keep
+            scope_summary = chosen_path
+            if chosen_root:
+                root_node = nodes.get(chosen_root)
+                if root_node:
+                    snippet = re.sub(r"\s+", " ", root_node["text"]).strip()
+                    if len(snippet) > 50:
+                        snippet = snippet[:49] + "…"
+                    scope_summary = f"{chosen_path} · root {chosen_root[:8]} · {snippet}"
+            result = browse_project(pd, nodes, native, scope_summary)
+            if result is None:
+                return
+            if result is BACK:
                 chosen_path = None
                 chosen_root = None
                 layer = "project"
                 continue
-            cmd, value = choice
-            ns = _ns_for(cmd, value, chosen_path, scope_root=chosen_root)
-            result = ns.func(ns)
-            if result is BACK:
-                # Back from the node picker → stay in action menu.
-                layer = "action"
-                continue
+            # result is a node dict — resume it
+            emit_resume(pd, result, by_uuid, exec_after=False)
             return
 
 

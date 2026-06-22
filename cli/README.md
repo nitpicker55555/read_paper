@@ -29,24 +29,40 @@ No deps — pure Python 3.9+ stdlib.
 ## Use
 
 Running `atr` with no arguments in an interactive terminal opens a two-step
-interactive flow: **conversation-root picker → action menu**.
+interactive flow: **root picker → unified browser**.
 
 A "project" here matches the Flask app's meaning: one root user prompt
 (parentUuid: null) plus the subtree growing from it. A single jsonl
 directory typically contains many such roots — the independent conversations
 you started in that path. The picker lists every root in the cwd's project
-dir (`~/.claude/projects/<slug>/`), sorted by latest activity. Each row
-shows the node count of the subtree, whether the root is natively reachable
-by stock `claude --resume` (`★`), the timestamp of the most recent activity
-in that subtree, and the root prompt itself.
+dir (`~/.claude/projects/<slug>/`), sorted by latest activity.
 
-After you pick a root, the second menu (list / leaves / tree / search /
-resume / info) operates **only on that root's subtree**. The picked root is
-shown in the action menu header so you remember what's scoped.
+After you pick a root, the **browser** opens directly into the tree view of
+that root's subtree. It's a single screen with:
 
-Press `a` inside the picker to widen the scope to every root across every
-project dir (handy when cd is in a directory with no project of its own).
-Pass `atr -a` to start in that mode.
+- a persistent **search box** at the top — just type to filter
+- a row of view tabs (`[tree]  list  leaves`) — press `⇥ Tab` to cycle
+- a paginated body that updates live as you type or change view
+
+Keys inside the browser:
+
+| key | action |
+|---|---|
+| any printable char | append to search filter |
+| `⌫ Backspace` | erase last search char (or back to project picker if empty) |
+| `↑ ↓` | move selection |
+| `⏎ Enter` | resume the highlighted node (writes synthetic jsonl, prints command) |
+| `⇥ Tab` / `⇧⇥` | cycle view: tree → list → leaves |
+| `⎋ Esc` | clear search (or back to project picker if empty) |
+| `^C` | quit |
+
+Tree view shows the full structural tree with long linear runs collapsed to
+`⋮ (N hidden)`. List and leaves views are the same tabular layout as the
+older `atr list` dump, except interactive. Search highlights matches inline.
+
+Press `a` inside the **project picker** to widen the scope to every root
+across every project dir (handy when cd is in a directory with no project
+of its own). Pass `atr -a` to start in that mode.
 
 ```bash
 # interactive: pick root conversation → pick action
