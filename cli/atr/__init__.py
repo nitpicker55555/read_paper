@@ -1067,6 +1067,12 @@ def _flatten_tree(roots: List[str], nodes: Dict[str, dict],
         def sort_key(uid: str) -> str:
             return nodes[uid]["timestamp"] or ""
 
+    # In reverse mode the caller flips the whole list afterwards, so a
+    # node we now emit with `└─` will end up visually ABOVE its parent —
+    # the corner needs to point down-right instead of up-right. Swap to
+    # `┌─` here so the rendered tree reads correctly bottom-up.
+    last_glyph = "┌─ " if reverse else "└─ "
+
     roots_sorted = sorted(roots, key=sort_key)
     for ri, root in enumerate(roots_sorted):
         if ri > 0:
@@ -1091,18 +1097,18 @@ def _flatten_tree(roots: List[str], nodes: Dict[str, dict],
                 out.append((uid, prefix, glyph, is_last))
             elif run_len == 2:
                 out.append((uid, prefix, glyph, is_last))
-                out.append((tail, cont_prefix, "└─ ", True))
+                out.append((tail, cont_prefix, last_glyph, True))
             else:
                 out.append((uid, prefix, glyph, is_last))
                 out.append((None, cont_prefix, f"⋮ ({run_len - 2} hidden)", True))
-                out.append((tail, cont_prefix, "└─ ", True))
+                out.append((tail, cont_prefix, last_glyph, True))
 
             tail_children = sorted(nodes[tail]["children"], key=sort_key)
             child_prefix = cont_prefix + ("   " if run_len > 1 else "")
             n_kids = len(tail_children)
             for i in range(n_kids - 1, -1, -1):
                 child_last = (i == n_kids - 1)
-                child_glyph = "└─ " if child_last else "├─ "
+                child_glyph = last_glyph if child_last else "├─ "
                 stack.append((tail_children[i], child_prefix, child_glyph, child_last))
     return out  # type: ignore[return-value]
 
