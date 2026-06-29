@@ -955,8 +955,7 @@ def render_table(items: List[dict], native_reachable: set, out, highlight: str =
         leaf = green("·") if not n["children"] else " "
         nat = purple("★") if n["uuid"] in native_reachable else " "
         text = re.sub(r"\s+", " ", n["text"]).strip()
-        if len(text) > text_w:
-            text = text[: text_w - 1] + "…"
+        text = _truncate_w(text, text_w)  # display-width aware (handles CJK)
         text = _highlight(text, highlight)
         _emit(f"{str(i).rjust(w_idx)}  {ts:<11}  {dim(uid)}  {leaf}  {nat}  {text}", out)
     _emit("", out)
@@ -981,12 +980,10 @@ def render_tree(roots: List[str], nodes: Dict[str, dict], native_reachable: set,
         nat = purple("★") if uid in native_reachable else " "
         leaf = green("·") if not n["children"] else " "
         text = re.sub(r"\s+", " ", n["text"]).strip()
-        text = _highlight(text, highlight)
         head_len = len(prefix) + len(glyph) + 1 + 11 + 1 + 8 + 1 + 1 + 1
         avail = max(20, cols - head_len - 1)
-        plain = re.sub(r"\x1b\[[0-9;]*m", "", text)
-        if len(plain) > avail:
-            text = text[: avail - 1] + "…"
+        text = _truncate_w(text, avail)  # display-width aware (handles CJK), then color
+        text = _highlight(text, highlight)
         _emit(f"{prefix}{glyph}{nat} {ts} {uid_short} {leaf} {text}", out)
 
     # Iterative DFS. Each stack entry is a node-to-process plus its visual
@@ -1068,12 +1065,18 @@ _VIEW_CYCLE = ("tree", "list", "leaves")
 
 
 def _flatten_tree(roots: List[str], nodes: Dict[str, dict],
-                  reverse: bool = False) -> List[Tuple[str, str, str, bool]]:
+                  reverse: bool = False,
+                  expanded_runs: Optional[set] = None
+                  ) -> List[Tuple[Optional[str], str, str, bool, Optional[Tuple[str, str]]]]:
     """Iterative depth-first walk that mirrors render_tree's compact collapsing.
 
-    Yields (uuid_or_None, prefix, branch_glyph, is_last). When uuid is None the
-    entry is the "⋮ N hidden" filler — not selectable. Linear single-child runs
-    are collapsed so a 1700-node tree renders in a screenful of structural rows.
+    Yields (uuid_or_None, prefix, branch_glyph, is_last, run_key). When uuid
+    is None the entry is the "⋮ N hidden" filler — selectable in the TUI as
+    an expansion trigger; `run_key` is `(head_uuid, tail_uuid)` identifying
+    which collapsed run it represents. For non-filler entries `run_key` is
+    None. Linear single-child runs are collapsed so a 1700-node tree renders
+    in a screenful of structural rows — pass the run's key in `expanded_runs`
+    to inline its intermediate nodes instead of the filler.
 
     `reverse=False`: classic top-down view, sibling sets oldest-first.
 
@@ -1083,7 +1086,8 @@ def _flatten_tree(roots: List[str], nodes: Dict[str, dict],
     afterwards to put that newest leaf at the top of the screen with the root
     at the bottom; sorting by subtree-max-ts means "newest" wins over "deepest".
     """
-    out: List[Tuple[Optional[str], str, str, bool]] = []
+    expanded = expanded_runs or set()
+    out: List[Tuple[Optional[str], str, str, bool, Optional[Tuple[str, str]]]] = []
 
     if reverse:
         # Iterative post-order so we don't hit recursion limit on deep trees.
@@ -1118,7 +1122,7 @@ def _flatten_tree(roots: List[str], nodes: Dict[str, dict],
     roots_sorted = sorted(roots, key=sort_key)
     for ri, root in enumerate(roots_sorted):
         if ri > 0:
-            out.append((None, "", "", True))  # blank separator between roots
+            out.append((None, "", "", True, None))  # blank separator between roots
         stack: List[Tuple[str, str, str, bool]] = [(root, "", "● ", True)]
         while stack:
             uid, prefix, glyph, is_last = stack.pop()
@@ -1136,14 +1140,22 @@ def _flatten_tree(roots: List[str], nodes: Dict[str, dict],
             run_len = len(run)
             cont_prefix = prefix + ("   " if is_last else "│  ")
             if run_len == 1:
-                out.append((uid, prefix, glyph, is_last))
+                out.append((uid, prefix, glyph, is_last, None))
             elif run_len == 2:
-                out.append((uid, prefix, glyph, is_last))
-                out.append((tail, cont_prefix, last_glyph, True))
+                out.append((uid, prefix, glyph, is_last, None))
+                out.append((tail, cont_prefix, last_glyph, True, None))
             else:
-                out.append((uid, prefix, glyph, is_last))
-                out.append((None, cont_prefix, f"⋮ ({run_len - 2} hidden)", True))
-                out.append((tail, cont_prefix, last_glyph, True))
+                run_key = (uid, tail)
+                out.append((uid, prefix, glyph, is_last, None))
+                if run_key in expanded:
+                    # Inline the previously-hidden middle nodes one per row,
+                    # sharing the same cont_prefix as the tail so the chain
+                    # reads as a single vertical column.
+                    for mid in run[1:-1]:
+                        out.append((mid, cont_prefix, "· ", True, None))
+                else:
+                    out.append((None, cont_prefix, f"⋮ ({run_len - 2} hidden)", True, run_key))
+                out.append((tail, cont_prefix, last_glyph, True, None))
 
             tail_children = sorted(nodes[tail]["children"], key=sort_key)
             child_prefix = cont_prefix + ("   " if run_len > 1 else "")
@@ -1221,7 +1233,14 @@ def _browse_render(state: dict, items: List[dict], all_nodes: Dict[str, dict],
             abs_idx = items.index(line_entry)  # could be O(n) but page is small
             n = line_entry.get("node")
             if line_entry["filler"]:
-                lines.append(f"  {line_entry['prefix']}{dim(line_entry['glyph'])}")
+                glyph_str = dim(line_entry["glyph"])
+                # Hint that fillers tied to a collapsed run are expandable.
+                if line_entry.get("run_key"):
+                    glyph_str += dim("  ⏎ expand")
+                if abs_idx == selected:
+                    lines.append("▶ " + line_entry["prefix"] + glyph_str)
+                else:
+                    lines.append("  " + line_entry["prefix"] + glyph_str)
                 continue
             ts = _format_time(n["timestamp"])
             uid_short = dim(n["uuid"][:8])
@@ -1299,19 +1318,22 @@ def _compute_browse_items(state: dict, all_nodes: Dict[str, dict]) -> List:
         roots = [u for u, n in all_nodes.items()
                  if not (n["parent"] and n["parent"] in all_nodes)]
         reverse = state.get("tree_reverse", False)
-        flat = _flatten_tree(roots, all_nodes, reverse=reverse)
+        expanded_runs = state.get("expanded_runs")
+        flat = _flatten_tree(roots, all_nodes, reverse=reverse,
+                             expanded_runs=expanded_runs)
         if reverse:
             # Flip the whole list so the newest leaf — the last node visited
             # by the subtree-max-ts ordered DFS — lands at the top.
             flat = list(reversed(flat))
         items = []
-        for uuid_, prefix, glyph, _is_last in flat:
+        for uuid_, prefix, glyph, _is_last, run_key in flat:
             items.append({
                 "uuid": uuid_,
                 "node": all_nodes[uuid_] if uuid_ else None,
                 "prefix": prefix,
                 "glyph": glyph,
                 "filler": uuid_ is None,
+                "run_key": run_key,
             })
         if search:
             items = [it for it in items
@@ -1473,6 +1495,9 @@ def browse_project(project_dir: Path, all_nodes: Dict[str, dict], native: set,
         "selected": 0,
         "offset": 0,
         "tree_reverse": _cfg("browser", "tree_order", default="oldest_first") == "newest_first",
+        # `(head_uuid, tail_uuid)` keys identifying collapsed runs the user
+        # has expanded via ⏎ on a filler row. Persists for the session.
+        "expanded_runs": set(),
     }
 
     items = _compute_browse_items(state, all_nodes)
@@ -1498,6 +1523,15 @@ def browse_project(project_dir: Path, all_nodes: Dict[str, dict], native: set,
             if key == "enter":
                 if items:
                     entry = items[state["selected"]]
+                    # Filler row tied to a collapsed run: expand it inline
+                    # instead of resuming. Keep selection on the same index
+                    # so the cursor naturally lands on the first revealed mid.
+                    if (isinstance(entry, dict)
+                            and entry.get("filler")
+                            and entry.get("run_key")):
+                        state["expanded_runs"].add(entry["run_key"])
+                        refresh(keep_selection=True)
+                        continue
                     node = entry.get("node") if isinstance(entry, dict) and "filler" in entry else entry
                     if node and driver is not None:
                         # Pop into the detail view. The detail view owns
