@@ -329,9 +329,16 @@ def build_nodes(
 
 def write_synthetic_session(project_dir: Path, target_uuid: str,
                             by_uuid: Dict[str, Tuple[dict, str]]) -> Tuple[str, int, Path]:
-    """Walk parentUuid from target back to root, write a fresh <new-sid>.jsonl pinning
-    the active leaf at target. Returns (new_sid, chain_length, file_path)."""
-    chain: List[str] = []
+    """Walk parentUuid from target back to root + collect target's reply
+    chain forward, write a fresh <new-sid>.jsonl pinning the active leaf at
+    the end of that reply chain. Without the forward walk the resumed
+    conversation would end at the user prompt with no assistant response
+    visible — Claude's --resume only walks BACKWARD via parentUuid from
+    leafUuid, so the reply events must be reachable from a descendant leaf.
+
+    Returns (new_sid, chain_length, file_path)."""
+    # Back chain: target + all ancestors via parentUuid, oldest first.
+    back_chain: List[str] = []
     cur: Optional[str] = target_uuid
     seen: set = set()
     while cur and cur not in seen:
@@ -339,9 +346,48 @@ def write_synthetic_session(project_dir: Path, target_uuid: str,
         entry = by_uuid.get(cur)
         if not entry:
             break
-        chain.append(entry[1])
+        back_chain.append(entry[1])
         cur = entry[0].get("parentUuid")
-    chain.reverse()
+    back_chain.reverse()
+
+    # Forward chain: every non-user-prompt descendant of target (the
+    # assistant reply chain + tool_use/tool_result events that belong to
+    # this turn). Stopping at user-prompt children means we don't pull in
+    # the next turn or sibling branches. BFS so multi-step asst/tool/asst
+    # sequences are fully captured.
+    children_index: Dict[str, List[str]] = {}
+    for uid, (msg, _) in by_uuid.items():
+        p = msg.get("parentUuid")
+        if p:
+            children_index.setdefault(p, []).append(uid)
+
+    forward_uuids: List[str] = []
+    visited: set = {target_uuid}
+    queue: List[str] = [target_uuid]
+    while queue:
+        u = queue.pop(0)
+        for child in children_index.get(u, []):
+            if child in visited:
+                continue
+            entry = by_uuid.get(child)
+            if not entry or _is_user_prompt(entry[0]):
+                continue
+            visited.add(child)
+            forward_uuids.append(child)
+            queue.append(child)
+
+    # Emit forward events sorted by their own timestamp so the file reads
+    # chronologically (matches the original jsonl's natural order).
+    forward_uuids.sort(key=lambda u: by_uuid[u][0].get("timestamp") or "")
+    forward_lines = [by_uuid[u][1] for u in forward_uuids]
+
+    # Pick the leaf for last-prompt: the latest-timestamp forward event,
+    # or target itself if the prompt has no reply (interrupted before any
+    # asst output).
+    if forward_uuids:
+        leaf_uuid = forward_uuids[-1]
+    else:
+        leaf_uuid = target_uuid
 
     new_sid = str(uuid.uuid4())
     new_path = project_dir / f"{new_sid}.jsonl"
@@ -362,10 +408,11 @@ def write_synthetic_session(project_dir: Path, target_uuid: str,
     last_prompt = json.dumps({
         "type": "last-prompt",
         "lastPrompt": target_text,
-        "leafUuid": target_uuid,
+        "leafUuid": leaf_uuid,
         "sessionId": new_sid,
     }, ensure_ascii=False)
 
+    chain = back_chain + forward_lines
     with new_path.open("w", encoding="utf-8") as f:
         for line in chain:
             f.write(line + "\n")

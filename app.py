@@ -1488,7 +1488,7 @@ def api_claude_code_resume_from_node() -> Response:
         return jsonify({"error": f"未在该项目中找到 uuid={target_uuid}"}), 404
 
     # Walk parentUuid chain from target back to root.
-    chain: List[Tuple[Dict[str, Any], str]] = []
+    back_chain: List[Tuple[Dict[str, Any], str]] = []
     cursor: Optional[str] = target_uuid
     seen: set = set()
     while cursor and cursor not in seen:
@@ -1496,9 +1496,38 @@ def api_claude_code_resume_from_node() -> Response:
         entry = all_msgs.get(cursor)
         if not entry:
             break
-        chain.append(entry)
+        back_chain.append(entry)
         cursor = entry[0].get("parentUuid")
-    chain.reverse()  # root first, target last
+    back_chain.reverse()  # root first, target last
+
+    # Forward chain: target's assistant reply + tool_use/tool_result events.
+    # Without this the resumed conversation ends at the user prompt with no
+    # response visible — Claude's --resume only walks BACKWARD via parentUuid
+    # from leafUuid, so reply events must be reachable from a descendant leaf.
+    # BFS over non-user-prompt descendants; stopping at user-prompt children
+    # means we don't pull in the next turn or sibling forks.
+    children_index: Dict[str, List[str]] = {}
+    for uid, (msg, _) in all_msgs.items():
+        p = msg.get("parentUuid")
+        if p:
+            children_index.setdefault(p, []).append(uid)
+    forward_uuids: List[str] = []
+    visited_fwd: set = {target_uuid}
+    bfs_queue: List[str] = [target_uuid]
+    while bfs_queue:
+        u = bfs_queue.pop(0)
+        for child in children_index.get(u, []):
+            if child in visited_fwd:
+                continue
+            entry = all_msgs.get(child)
+            if not entry or _is_claude_user_prompt(entry[0]):
+                continue
+            visited_fwd.add(child)
+            forward_uuids.append(child)
+            bfs_queue.append(child)
+    forward_uuids.sort(key=lambda u: all_msgs[u][0].get("timestamp") or "")
+    # Leaf for last-prompt = end of the reply chain (or target if empty).
+    leaf_uuid = forward_uuids[-1] if forward_uuids else target_uuid
 
     # Claude Code maps --resume <id> to <id>.jsonl with strict id↔filename match — any
     # prefix on the filename makes it report "No conversation found". So just use a plain
@@ -1525,7 +1554,7 @@ def api_claude_code_resume_from_node() -> Response:
         {
             "type": "last-prompt",
             "lastPrompt": target_text,
-            "leafUuid": target_uuid,
+            "leafUuid": leaf_uuid,
             "sessionId": new_sid,
         },
         ensure_ascii=False,
@@ -1533,8 +1562,10 @@ def api_claude_code_resume_from_node() -> Response:
 
     try:
         with new_path.open("w", encoding="utf-8") as out:
-            for _, raw_line in chain:
+            for _, raw_line in back_chain:
                 out.write(raw_line + "\n")
+            for fwd_uuid in forward_uuids:
+                out.write(all_msgs[fwd_uuid][1] + "\n")
             out.write(last_prompt_event + "\n")
     except OSError as exc:
         return jsonify({"error": f"写入失败：{exc}"}), 500
@@ -1542,7 +1573,7 @@ def api_claude_code_resume_from_node() -> Response:
     return jsonify({
         "session_id": new_sid,
         "file": str(new_path),
-        "chain_length": len(chain),
+        "chain_length": len(back_chain) + len(forward_uuids),
         "command": f"claude --resume {new_sid}",
         "target_text_preview": target_text[:80],
     })
